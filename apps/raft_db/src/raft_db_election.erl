@@ -47,9 +47,9 @@ start_link({Self, Servers}) when is_atom(Self) ->
     gen_server:start_link({local, Self}, ?MODULE, {Self, Servers}, []).
 
 file_name({_Reg, Node}) when is_atom(Node) ->
-    atom_to_list(Node);
+    file_name(Node);
 file_name(Self) when is_atom(Self) ->
-    atom_to_list(Self).
+    atom_to_list(Self) ++ ".db".
 
 load_state(Self) ->
     FileName = file_name(Self),
@@ -59,6 +59,12 @@ load_state(Self) ->
         {error, _} ->
             {0, null}
     end.
+
+save_state(Self, NewTerm, OldTerm, NewVotedFor, OldVoteFor) when NewTerm > OldTerm orelse NewVotedFor =/= OldVoteFor ->
+    FileName = file_name(Self),
+    file:write_file(FileName, term_to_binary({NewTerm, NewVotedFor}));
+save_state(_, _, _, _, _) ->
+    ok.
 
 init({Self, Servers}) ->
     % register_server(Self),
@@ -139,12 +145,6 @@ handle_cast({response_entries, Server, CurTerm, true}, #state{status=leader,
     end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
-
-save_state(Self, NewTerm, OldTerm, NewVotedFor, OldVoteFor) when NewTerm > OldTerm orelse NewVotedFor =/= OldVoteFor ->
-    FileName = file_name(Self),
-    file:write_file(FileName, term_to_binary({NewTerm, NewVotedFor}));
-save_state(_, _, _, _, _) ->
-    ok.
 
 send_msg(To, Msg) ->
     gen_server:cast(To, Msg).
