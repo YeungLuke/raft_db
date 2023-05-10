@@ -49,7 +49,7 @@ start_link({Self, Servers}) when is_atom(Self) ->
 file_name({_Reg, Node}) when is_atom(Node) ->
     file_name(Node);
 file_name(Self) when is_atom(Self) ->
-    atom_to_list(Self) ++ ".db".
+    atom_to_list(Self) ++ ".dat".
 
 load_state(Self) ->
     FileName = file_name(Self),
