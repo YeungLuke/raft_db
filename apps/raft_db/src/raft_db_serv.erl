@@ -78,16 +78,8 @@ load_state(Self) ->
         _ ->
             {0, null}
     end.
-    % case file:read_file(FileName) of
-    %     {ok, Binary} ->
-    %         binary_to_term(Binary);
-    %     {error, _} ->
-    %         {0, null}
-    % end.
 
 save_state(Self, NewTerm, OldTerm, NewVotedFor, OldVoteFor) when NewTerm > OldTerm orelse NewVotedFor =/= OldVoteFor ->
-    % FileName = file_name(Self),
-    % file:write_file(FileName, term_to_binary({NewTerm, NewVotedFor}));
     dets:insert(name(Self), {state, NewTerm, NewVotedFor});
 save_state(_, _, _, _, _) ->
     ok.
@@ -129,6 +121,10 @@ delete_conflict_entries(Self, Index, _Term) ->
             ok
     end.
 
+is_candidate_up_to_date(Self, LastLogIndex, LastLogTerm) ->
+    {CurLastLogIndex, CurLastLogTerm} = last_log_info(Self),
+    LastLogTerm > CurLastLogTerm orelse (LastLogTerm =:= CurLastLogTerm andalso LastLogIndex >= CurLastLogIndex).
+
 init({Self, Servers}) ->
     {Term, VotedFor} = load_state(Self),
     log("I am follower ~p in term ~p~n", [Self, Term]),
@@ -156,30 +152,45 @@ handle_call({put, Key, Value}, _From, #state{status=leader,
         _ ->
             {reply, todo, State}
     end;
-handle_call(stop, _From, State) ->
+handle_call(stop, _From, #state{self=Self} = State) ->
+    dets:close(name(Self)),
     {stop, normal, stopped, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast({request_vote, Term, CandidateId, {_LastLogIndex, _LastLogTerm}},
+handle_cast({request_vote, Term, CandidateId, {LastLogIndex, LastLogTerm}},
             #state{cur_term=CurTerm,self=Self}=State)
   when Term > CurTerm ->
-    send_msg(CandidateId, {response_vote, Self, Term, true}),
-    {noreply, convert_to_follower(Term, CandidateId, State)};
-handle_cast({request_vote, CurTerm, CandidateId, _}, #state{status=follower,
+    UpToDate = is_candidate_up_to_date(Self, LastLogIndex, LastLogTerm),
+    case UpToDate of
+        true ->
+            send_msg(CandidateId, {response_vote, Self, Term, true}),
+            {noreply, convert_to_follower(Term, CandidateId, State)};
+        false ->
+            send_msg(CandidateId, {response_vote, Self, Term, false}),
+            {noreply, convert_to_follower(Term, null, State)}
+    end;
+handle_cast({request_vote, CurTerm, CandidateId, {LastLogIndex, LastLogTerm}}, #state{status=follower,
                                                          vote_for=VotedFor,
                                                          cur_term=CurTerm,
                                                          self=Self}=State) ->
     case VotedFor =:= null orelse VotedFor =:= CandidateId of
         true ->
-            send_msg(CandidateId, {response_vote, Self, CurTerm, true}),
-            {noreply, convert_to_follower(CurTerm, CandidateId, State)};
+            UpToDate = is_candidate_up_to_date(Self, LastLogIndex, LastLogTerm),
+            case UpToDate of
+                true ->
+                    send_msg(CandidateId, {response_vote, Self, CurTerm, true}),
+                    {noreply, convert_to_follower(CurTerm, CandidateId, State)};
+                false ->
+                    send_msg(CandidateId, {response_vote, Self, CurTerm, false}),
+                    {noreply, State}
+            end;
         _ ->
             send_msg(CandidateId, {response_vote, Self, CurTerm, false}),
             {noreply, State}
     end;
 handle_cast({request_vote, Term, CandidateId, _}, #state{cur_term=CurTerm,self=Self}=State) when Term < CurTerm ->
-    send_msg(CandidateId, {response_vote, Self, CurTerm, false}),% should be CurTerm???
+    send_msg(CandidateId, {response_vote, Self, CurTerm, false}),
     {noreply, State};
 handle_cast({response_vote, _Server, Term, _}, #state{cur_term=CurTerm}=State) when Term > CurTerm ->
     {noreply, convert_to_follower(Term, null, State)};
@@ -267,7 +278,7 @@ convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers}=State)
     log("I am candidate ~p in term ~p~n", [Self, NewTerm]),
     cancel_timers(State),
     save_state(Self, NewTerm, CurTerm, Self, null),
-    [send_msg(Other, {request_vote, NewTerm, Self, {1, 1}}) || Other <- Servers, Other =/= Self],
+    [send_msg(Other, {request_vote, NewTerm, Self, last_log_info(Self)}) || Other <- Servers, Other =/= Self],
     TRef = erlang:start_timer(rand:uniform(?ELECTION_TIMEOUT) + ?ELECTION_TIMEOUT, self(), election_timeout),
     State#state{status=candidate,
                 vote_for=Self,
