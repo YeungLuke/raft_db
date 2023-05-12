@@ -2,7 +2,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start/1, stop/1, start_link/1, who_is_leader/1, put/3]).
+-export([start/1, stop/1, start_link/1, who_is_leader/1, put/3, get/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(HEARTBEAT_TIME_INTERVAL, 300).
@@ -13,7 +13,7 @@
 -record(leader_state, {href,
                        lived_servers = sets:new()}).
 
--record(log_state, {state_machine=#{},
+-record(log_state, {state_machine=raft_db_state_machine:new(),
                     % Volatile state on all servers:
                     commit_index=0, % index of highest log entry known to be committed (initialized to 0, increases monotonically)
                     last_applied=0, % index of highest log entry applied to state machine (initialized to 0, increases monotonically)
@@ -53,7 +53,10 @@ who_is_leader(Server) ->
     end.
 
 put(Server, Key, Value) ->
-    gen_server:call(Server, {put, Key, Value}).
+    gen_server:call(Server, {cmd, sn, {put, Key, Value}}).
+
+get(Server, Key) ->
+    gen_server:call(Server, {cmd, sn, {get, Key}}).
 
 start_link({{Name, Node}=Self, Servers}) when is_atom(Node) ->
     gen_server:start_link({local, Name}, ?MODULE, {Self, Servers}, []);
@@ -121,6 +124,20 @@ get_logs_from(Self, PrevIndex) ->
     % todo use select or match rewrite
     lists:flatten([dets:lookup(Name, I) || I <- lists:seq(max(PrevIndex, 1), LastIndex)]).
 
+apply_to_state_machine(_, S, From, To, Results) when From > To ->
+    {S, Results};
+apply_to_state_machine(Self, S, From, To, Results) ->
+    case dets:lookup(name(Self), From) of
+        [{From, _, _, Cmd}] ->
+            {NewS, Result} = raft_db_state_machine:apply_cmd(S, Cmd),
+            apply_to_state_machine(Self, NewS, From + 1, To, Results#{From => Result});
+        _ ->
+            apply_to_state_machine(Self, S, From + 1, To, Results)
+    end.
+
+apply_to_state_machine(Self, S, From, To) ->
+    apply_to_state_machine(Self, S, From, To, #{}).
+
 delete_conflict_entries(Self, Index, _Term) ->
     Name = name(Self),
     case dets:lookup(Name, last) of
@@ -142,7 +159,7 @@ init({Self, Servers}) ->
 
 handle_call(who_is_leader, _From, State) ->
     {reply, State#state.leader, State};
-handle_call({put, Key, Value}, From, #state{status=leader,
+handle_call({cmd, _, Cmd}, From, #state{status=leader,
                                             log_state=LogState,
                                             cur_term=CurTerm,
                                             servers=Servers,
@@ -152,7 +169,7 @@ handle_call({put, Key, Value}, From, #state{status=leader,
         [] ->
             {LastLogIndex, _LastLogTerm} = last_log_info(Self),
             Index = LastLogIndex + 1,
-            LogEntry = {Index, CurTerm, client_sn_todo, {put, Key, Value}},
+            LogEntry = {Index, CurTerm, client_sn_todo, Cmd},
             dets:insert(name(Self), [LogEntry, {last, Index}]),
             cancel_timers(State#state.dedicate_state),
             HRef = replicate_logs(CurTerm, Self, Servers, LogState),
@@ -271,14 +288,25 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                 _ ->
                     LogState#log_state.commit_index
             end,
-            % todo apply to state machine
+            % apply to state machine
+            {NewS, Results} = 
+            case NewLogState#log_state.last_applied < NewCommitIndex of
+                true ->
+                    apply_to_state_machine(Self, NewLogState#log_state.state_machine,
+                                           NewLogState#log_state.last_applied + 1, NewCommitIndex);
+                _ ->
+                    {NewLogState#log_state.state_machine, #{}}
+            end,
             % reply to client if commitIndex >= index of client
-            [gen_server:reply(From, {ok, Index}) || {Index, From} <- NewLogState#log_state.need_reply, NewCommitIndex >= Index], 
+            [gen_server:reply(From, maps:get(Index, Results)) ||
+             {Index, From} <- NewLogState#log_state.need_reply,
+             NewCommitIndex >= Index, Index > NewLogState#log_state.last_applied], 
             NewNeedReply = [{Index, From} || {Index, From} <- NewLogState#log_state.need_reply, NewCommitIndex < Index],
             % todo if follower matchindex =/= last, send remain log entries
             {noreply, State#state{tref=NewTRef, dedicate_state=NewDState,
                                   log_state=NewLogState#log_state{commit_index=NewCommitIndex,
-                                                                  need_reply=NewNeedReply}}};
+                                                                  need_reply=NewNeedReply,
+                                                                  state_machine=NewS}}};
         false ->
             % decrement nextIndex and retry
             PrevIndex = maps:get(Server, LogState#log_state.next_index) - 1,
