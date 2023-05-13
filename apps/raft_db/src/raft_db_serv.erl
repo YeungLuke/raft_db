@@ -8,9 +8,11 @@
 -define(HEARTBEAT_TIME_INTERVAL, 300).
 -define(ELECTION_TIMEOUT, 1000).
 
+-record(follower_info, {href=null, last_msg_type=null}).
+
 -record(follower_state, {}).
 -record(candidate_state, {votes = sets:new()}).
--record(leader_state, {href,
+-record(leader_state, {followers_info = #{},
                        lived_servers = sets:new()}).
 
 -record(log_state, {state_machine=raft_db_state_machine:new(),
@@ -174,7 +176,6 @@ handle_call(who_is_leader, _From, State) ->
 handle_call({cmd, Sn, Cmd}, From, #state{status=leader,
                                          log_state=LogState=#log_state{last_log_info={LastLogIndex, _}, need_reply=NeedReply},
                                          cur_term=CurTerm,
-                                         servers=Servers,
                                          self=Self,
                                          dedicate_state=DState}=State) ->
     case NeedReply of
@@ -182,11 +183,10 @@ handle_call({cmd, Sn, Cmd}, From, #state{status=leader,
             Index = LastLogIndex + 1,
             LastLogInfo = append_log_entries(Self, [{Index, CurTerm, Sn, Cmd}]),
             NewLogState = LogState#log_state{need_reply=[{Index, From}], last_log_info=LastLogInfo},
-            cancel_timers(State#state.dedicate_state),
-            HRef = replicate_logs(CurTerm, Self, Servers, NewLogState),
+            NewFollowersInfo = replicate_logs(CurTerm, Self, NewLogState, DState#leader_state.followers_info),
             log("I am leader ~p in term ~p, I am replicating log index ~p~n",[Self, CurTerm, Index]),
             {noreply, State#state{log_state=NewLogState,
-                                  dedicate_state=DState#leader_state{href=HRef}}};
+                                  dedicate_state=DState#leader_state{followers_info=NewFollowersInfo}}};
         _ ->
             {reply, todo, State}
     end;
@@ -238,8 +238,9 @@ handle_cast({append_entries, Term, LeaderId, _, _, _, _},
             #state{cur_term=CurTerm, self=Self}=State) when Term < CurTerm ->
     send_msg(LeaderId, {response_entries, Self, CurTerm, false, not_change}),
     {noreply, State};
-handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntries, CommitIndex},
-            #state{status=Status, vote_for=VotedFor, cur_term=CurTerm, self=Self, log_state=LogState=#log_state{last_log_info=LastLogInfo}}=State)
+handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntries, LeaderCommitIndex},
+            #state{status=Status, vote_for=VotedFor, cur_term=CurTerm, self=Self,
+                   log_state=LogState=#log_state{last_log_info=LastLogInfo, commit_index=CommitIndex}}=State)
   when Term > CurTerm orelse (Term =:= CurTerm andalso Status =/= leader) ->
     % todo ignore repeat msg
     % todo If commitIndex > lastApplied apply to state machine
@@ -259,9 +260,16 @@ handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntri
     end,
     send_msg(LeaderId, {response_entries, Self, Term, Succ, NewLastLogIndex}),
     NewVotedFor = case Term > CurTerm of true -> null; false -> VotedFor end,
-     % todo If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+    % todo If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+    NewCommitIndex = 
+    case LeaderCommitIndex > CommitIndex of
+        true ->
+            min(LeaderCommitIndex, NewLastLogIndex);
+        false ->
+            CommitIndex
+    end,
     {noreply, convert_to_follower(Term, NewVotedFor, LeaderId,
-                                  State#state{log_state=LogState#log_state{last_log_info=NewLastLogInfo}})};
+                                  State#state{log_state=LogState#log_state{last_log_info=NewLastLogInfo, commit_index=NewCommitIndex}})};
 handle_cast({response_entries, _Server, Term, _, _}, #state{cur_term=CurTerm}=State) when Term > CurTerm ->
     {noreply, convert_to_follower(Term, null, State)};
 handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
@@ -271,8 +279,8 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                                                  match_index=MatchIndex,
                                                  commit_index=CommitIndex,
                                                  last_log_info={LastLogIndex, _}},
-                   dedicate_state=DState}=State) ->
-    NewLivedServers = sets:add_element(Server, DState#leader_state.lived_servers),
+                   dedicate_state=DState=#leader_state{followers_info=FollowersInfo,lived_servers=LivedServers}}=State) ->
+    NewLivedServers = sets:add_element(Server, LivedServers),
     {NewTRef, NewDState} = 
     case sets:size(NewLivedServers) >= (length(Servers) div 2) of
         true ->
@@ -281,6 +289,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
         _ ->
             {TRef, DState#leader_state{lived_servers=NewLivedServers}}
     end,
+    FollowerInfo = (maps:get(Server, FollowersInfo))#follower_info{last_msg_type=null},
     case Succ of
         true ->
             % update nextIndex and matchIndex for follwer
@@ -321,8 +330,16 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
              {Index, From} <- NewLogState#log_state.need_reply,
              NewCommitIndex >= Index, Index > NewLogState#log_state.last_applied], 
             NewNeedReply = [{Index, From} || {Index, From} <- NewLogState#log_state.need_reply, NewCommitIndex < Index],
-            % todo if follower matchindex =/= last, send remain log entries
-            {noreply, State#state{tref=NewTRef, dedicate_state=NewDState,
+            % if follower matchindex =/= last, send remain log entries
+            NewFollowerInfo = 
+            case NewMatch < LastLogIndex of
+                true ->
+                    replicate_one_follower(CurTerm, Self, Server, LogState, FollowerInfo);
+                _ ->
+                    FollowerInfo
+            end,
+            {noreply, State#state{tref=NewTRef,
+                                  dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server => NewFollowerInfo}},
                                   log_state=NewLogState#log_state{commit_index=NewCommitIndex,
                                                                   need_reply=NewNeedReply,
                                                                   state_machine=NewS}}};
@@ -336,8 +353,9 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                 _ ->
                     LogState
             end,
-            replicate_one_follower(CurTerm, Self, Server, LogState),
-            {noreply, State#state{tref=NewTRef, dedicate_state=NewDState, log_state=NewLogState}}
+            NewFollowerInfo = replicate_one_follower(CurTerm, Self, Server, LogState, FollowerInfo),
+            {noreply, State#state{tref=NewTRef, log_state=NewLogState,
+                                  dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server => NewFollowerInfo}}}}
     end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -347,15 +365,16 @@ send_msg(To, Msg) ->
 
 handle_info({timeout, TRef, election_timeout}, #state{tref=TRef}=State) ->
     {noreply, convert_to_candidate(State)};
-handle_info({timeout, HRef, heartbeat_timeout}, #state{status=Status,
-                                                       cur_term=CurTerm,
-                                                       self=Self,
-                                                       servers=Servers,
-                                                       dedicate_state=DState}=State)
-  when Status =:= leader, DState#leader_state.href =:= HRef ->
-    % todo resend replicating log entries to not responce follower
-    NewHRef = send_heartbeat(CurTerm, Self, Servers, State#state.log_state),
-    {noreply, State#state{dedicate_state=DState#leader_state{href=NewHRef}}};
+handle_info({timeout, HRef, {heartbeat_timeout, Follower}},
+            #state{status=leader, cur_term=CurTerm, self=Self, log_state=LogState,
+                   dedicate_state=DState=#leader_state{followers_info=FollowersInfo}}=State) ->
+    case FollowersInfo of
+        #{Follower := FollowerInfo=#follower_info{href=HRef}} ->
+            NewFollowerInfo = replicate_one_follower(CurTerm, Self, Follower, LogState, FollowerInfo#follower_info{href=null}),
+            {noreply, State#state{dedicate_state=DState#leader_state{followers_info=FollowersInfo#{Follower => NewFollowerInfo}}}};
+        _ ->
+            {noreply, State}
+    end;
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -376,12 +395,14 @@ convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers, log_st
 convert_to_leader(#state{cur_term=Term, self=Self, servers=Servers, log_state=LogState=#log_state{last_log_info={LastLogIndex, _}}}=State) ->
     log("I am leader ~p in term ~p~n",[Self, Term]),
     cancel_timers(State),
-    NextIndex = maps:from_list([{Other, LastLogIndex + 1} || Other <- Servers, Other =/= Self]),
-    MatchIndex = maps:from_list([{Other, 0} || Other <- Servers, Other =/= Self]),
+    Followers = Servers -- [Self],
+    NextIndex = from_keys(Followers, LastLogIndex + 1),
+    MatchIndex = from_keys(Followers, 0),
     NewLogState = LogState#log_state{next_index=NextIndex, match_index=MatchIndex, need_reply=[]},
-    HRef = send_heartbeat(Term, Self, Servers, NewLogState),
+    FollowersInfo = send_heartbeat(Term, Self, NewLogState, from_keys(Followers, #follower_info{})),
     TRef = erlang:start_timer(?ELECTION_TIMEOUT, self(), election_timeout),
-    State#state{status=leader, tref=TRef, leader=Self, dedicate_state=#leader_state{href=HRef}, log_state=NewLogState}.
+    State#state{status=leader, tref=TRef, leader=Self,
+                dedicate_state=#leader_state{followers_info=FollowersInfo}, log_state=NewLogState}.
 
 convert_to_follower(NewTerm, NewVotedFor, State) ->
     convert_to_follower(NewTerm, NewVotedFor, null, State).
@@ -405,11 +426,8 @@ convert_to_follower(NewTerm, NewVotedFor, NewLeader, #state{cur_term=OldTerm, vo
                 tref=TRef,
                 dedicate_state=#follower_state{}}.
 
-cancel_timers(#state{tref=TRef, dedicate_state=DState}) ->
-    erlang:cancel_timer(TRef),
-    cancel_timers(DState);
-cancel_timers(#leader_state{href=HRef}) ->
-    erlang:cancel_timer(HRef);
+cancel_timers(#state{tref=TRef}) ->
+    erlang:cancel_timer(TRef);
 cancel_timers(_) ->
     ok.
 
@@ -420,20 +438,32 @@ get_follower_missing_log(Self, Follower, #log_state{next_index=NextIndex, last_l
     LogEntries = get_logs_from(Self, PrevIndex + 1, LastIndex),
     {PrevIndex, PrevTerm, LogEntries}.
 
-replicate_one_follower(Term, Self, Follower, LogState) ->
-    {PrevIndex, PrevTerm, LogEntries} = get_follower_missing_log(Self, Follower, LogState),
-    Msg = {append_entries, Term, Self, PrevIndex, PrevTerm, LogEntries, LogState#log_state.commit_index},
-    send_msg(Follower, Msg).
+replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo=#follower_info{last_msg_type=LastType, href=HRef}) ->
+    case LastType =:= normal andalso is_reference(HRef) of
+        true ->
+            FollowerInfo;
+        _ ->
+            case is_reference(HRef) of true -> erlang:cancel_timer(HRef); _ -> ok end,
+            {PrevIndex, PrevTerm, LogEntries} = get_follower_missing_log(Self, Follower, LogState),
+            Msg = {append_entries, Term, Self, PrevIndex, PrevTerm, LogEntries, LogState#log_state.commit_index},
+            send_msg(Follower, Msg),
+            % todo calc timeout by msg length
+            MsgType = case LogEntries of [] -> heartbeat; _ -> normal end,
+            NewHRef = erlang:start_timer(?HEARTBEAT_TIME_INTERVAL, self(), {heartbeat_timeout, Follower}),
+            FollowerInfo#follower_info{last_msg_type=MsgType, href=NewHRef}
+    end.
 
-send_heartbeat(Term, Self, Servers, LogState) ->
-    replicate_logs(Term, Self, Servers, LogState).
+send_heartbeat(Term, Self, LogState, FollowersInfo) ->
+    replicate_logs(Term, Self, LogState, FollowersInfo).
 
-replicate_logs(Term, Self, Servers, LogState) ->
-    % todo href for every follower, and if server have not responce in heartbeat timeout do not send
-    % todo get folLower missing Log can cache
-    HRef = erlang:start_timer(rand:uniform(?HEARTBEAT_TIME_INTERVAL), self(), heartbeat_timeout),
-    [replicate_one_follower(Term, Self, Follower, LogState) || Follower <- Servers, Follower =/= Self],
-    HRef.
+replicate_logs(Term, Self, LogState, FollowersInfo) ->
+    % todo get follower missing Log can cache
+    maps:map(fun(Follower, FollowerInfo) -> replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo) end,
+             FollowersInfo).
+
+% not exist in otp 20
+from_keys(Keys, Value) ->
+    maps:from_list([{Key, Value} || Key <- Keys]).
 
 log(Format, Args) ->
     io:format(Format, Args).
