@@ -21,7 +21,8 @@
                     next_index=#{}, % for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
                     match_index=#{}, % for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
                     % Other
-                    need_reply=[]}).
+                    need_reply=[],
+                    last_log_info={0, 0}}).
 
 -record(state, {status = follower,
                 vote_for = null, % candidateId that received vote in current term (or null if none)
@@ -53,10 +54,10 @@ who_is_leader(Server) ->
     end.
 
 put(Server, Key, Value) ->
-    gen_server:call(Server, {cmd, sn, {put, Key, Value}}).
+    gen_server:call(Server, {cmd, client_sn_todo, {put, Key, Value}}).
 
 get(Server, Key) ->
-    gen_server:call(Server, {cmd, sn, {get, Key}}).
+    gen_server:call(Server, {cmd, client_sn_todo, {get, Key}}).
 
 start_link({{Name, Node}=Self, Servers}) when is_atom(Node) ->
     gen_server:start_link({local, Name}, ?MODULE, {Self, Servers}, []);
@@ -75,17 +76,20 @@ load_state(Self) ->
     Name = name(Self),
     FileName = file_name(Self),
     {ok, Name} = dets:open_file(Name, [{file, FileName}]),
-    case dets:lookup(Name, state) of
-        [{state, Term, VotedFor}] ->
-            {Term, VotedFor};
-        _ ->
-            {0, null}
-    end.
+    {vote_info(Self), last_log_info(Self)}.
 
 save_state(Self, NewTerm, OldTerm, NewVotedFor, OldVoteFor) when NewTerm > OldTerm orelse NewVotedFor =/= OldVoteFor ->
     dets:insert(name(Self), {state, NewTerm, NewVotedFor});
 save_state(_, _, _, _, _) ->
     ok.
+
+vote_info(Self) ->
+    case dets:lookup(name(Self), state) of
+        [{state, Term, VotedFor}] ->
+            {Term, VotedFor};
+        _ ->
+            {0, null}
+    end.
 
 log_info(Self, Index) ->
     case dets:lookup(name(Self), Index) of
@@ -114,15 +118,14 @@ log_match(Self, Index, Term) ->
     end.
 
 append_log_entries(Self, LogEntries) ->
-    {LastIndex, _, _, _} = lists:last(LogEntries),
-    dets:insert(name(Self), LogEntries ++ [{last, LastIndex}]),
-    LastIndex.
+    {LastLogIndex, LastLogTerm, _, _} = lists:last(LogEntries),
+    dets:insert(name(Self), LogEntries ++ [{last, LastLogIndex}]),
+    {LastLogIndex, LastLogTerm}.
 
-get_logs_from(Self, PrevIndex) ->
-    {LastIndex, _} = last_log_info(Self),
+get_logs_from(Self, From, To) ->
     Name = name(Self),
     % todo use select or match rewrite
-    lists:flatten([dets:lookup(Name, I) || I <- lists:seq(max(PrevIndex, 1), LastIndex)]).
+    lists:flatten([dets:lookup(Name, I) || I <- lists:seq(max(From, 1), To)]).
 
 apply_to_state_machine(_, S, From, To, Results) when From > To ->
     {S, Results};
@@ -138,43 +141,41 @@ apply_to_state_machine(Self, S, From, To, Results) ->
 apply_to_state_machine(Self, S, From, To) ->
     apply_to_state_machine(Self, S, From, To, #{}).
 
-delete_conflict_entries(Self, Index, _Term) ->
+delete_conflict_entries(Self, {LastLogIndex, _}, Index) when Index =< LastLogIndex ->
     Name = name(Self),
-    case dets:lookup(Name, last) of
-        [{last, LastIndex}] when Index =< LastIndex ->
-            [dets:delete(Name, I) || I <- lists:seq(Index, LastIndex)];
-        _ ->
-            ok
-    end.
+    dets:insert(Name, {last, LastLogIndex - 1});
+    % [dets:delete(Name, I) || I <- lists:seq(Index, LastLogIndex)];
+delete_conflict_entries(_, _, _) ->
+    ok.
 
-is_candidate_up_to_date(Self, LastLogIndex, LastLogTerm) ->
-    {CurLastLogIndex, CurLastLogTerm} = last_log_info(Self),
-    LastLogTerm > CurLastLogTerm orelse (LastLogTerm =:= CurLastLogTerm andalso LastLogIndex >= CurLastLogIndex).
+is_candidate_up_to_date({CurLastLogIndex, CurLastLogTerm}, {CandidateLastLogIndex, CandidateLastLogTerm}) ->
+    CandidateLastLogTerm > CurLastLogTerm orelse 
+        (CandidateLastLogTerm =:= CurLastLogTerm andalso CandidateLastLogIndex >= CurLastLogIndex).
 
 init({Self, Servers}) ->
-    {Term, VotedFor} = load_state(Self),
+    {{Term, VotedFor}, LastLogInfo} = load_state(Self),
     log("I am follower ~p in term ~p~n", [Self, Term]),
     TRef = erlang:start_timer(rand:uniform(?ELECTION_TIMEOUT) + ?ELECTION_TIMEOUT, self(), election_timeout),
-    {ok, #state{vote_for=VotedFor, cur_term=Term, self=Self, servers=Servers, tref=TRef}}.
+    {ok, #state{vote_for=VotedFor, cur_term=Term, self=Self, servers=Servers, tref=TRef,
+                log_state=#log_state{last_log_info=LastLogInfo}}}.
 
 handle_call(who_is_leader, _From, State) ->
     {reply, State#state.leader, State};
-handle_call({cmd, _, Cmd}, From, #state{status=leader,
-                                            log_state=LogState,
-                                            cur_term=CurTerm,
-                                            servers=Servers,
-                                            self=Self,
-                                            dedicate_state=DState}=State) ->
-    case LogState#log_state.need_reply of
+handle_call({cmd, Sn, Cmd}, From, #state{status=leader,
+                                         log_state=LogState=#log_state{last_log_info={LastLogIndex, _}, need_reply=NeedReply},
+                                         cur_term=CurTerm,
+                                         servers=Servers,
+                                         self=Self,
+                                         dedicate_state=DState}=State) ->
+    case NeedReply of
         [] ->
-            {LastLogIndex, _LastLogTerm} = last_log_info(Self),
             Index = LastLogIndex + 1,
-            LogEntry = {Index, CurTerm, client_sn_todo, Cmd},
-            dets:insert(name(Self), [LogEntry, {last, Index}]),
+            LastLogInfo = append_log_entries(Self, [{Index, CurTerm, Sn, Cmd}]),
+            NewLogState = LogState#log_state{need_reply=[{Index, From}], last_log_info=LastLogInfo},
             cancel_timers(State#state.dedicate_state),
-            HRef = replicate_logs(CurTerm, Self, Servers, LogState),
+            HRef = replicate_logs(CurTerm, Self, Servers, NewLogState),
             log("I am leader ~p in term ~p, I am replicating log index ~p~n",[Self, CurTerm, Index]),
-            {noreply, State#state{log_state=LogState#log_state{need_reply=[{Index, From}]},
+            {noreply, State#state{log_state=NewLogState,
                                   dedicate_state=DState#leader_state{href=HRef}}};
         _ ->
             {reply, todo, State}
@@ -185,10 +186,10 @@ handle_call(stop, _From, #state{self=Self} = State) ->
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
-handle_cast({request_vote, Term, CandidateId, {LastLogIndex, LastLogTerm}},
-            #state{cur_term=CurTerm,self=Self}=State)
+handle_cast({request_vote, Term, CandidateId, CandidateLastLogInfo},
+            #state{cur_term=CurTerm, self=Self, log_state=#log_state{last_log_info=LastLogInfo}}=State)
   when Term > CurTerm ->
-    UpToDate = is_candidate_up_to_date(Self, LastLogIndex, LastLogTerm),
+    UpToDate = is_candidate_up_to_date(LastLogInfo, CandidateLastLogInfo),
     case UpToDate of
         true ->
             send_msg(CandidateId, {response_vote, Self, Term, true}),
@@ -197,11 +198,9 @@ handle_cast({request_vote, Term, CandidateId, {LastLogIndex, LastLogTerm}},
             send_msg(CandidateId, {response_vote, Self, Term, false}),
             {noreply, convert_to_follower(Term, null, State)}
     end;
-handle_cast({request_vote, CurTerm, CandidateId, {LastLogIndex, LastLogTerm}}, #state{status=follower,
-                                                         vote_for=VotedFor,
-                                                         cur_term=CurTerm,
-                                                         self=Self}=State) ->
-    case (VotedFor =:= null orelse VotedFor =:= CandidateId) andalso is_candidate_up_to_date(Self, LastLogIndex, LastLogTerm) of
+handle_cast({request_vote, CurTerm, CandidateId, CandidateLastLogInfo},
+            #state{status=follower, vote_for=VotedFor, cur_term=CurTerm, self=Self, log_state=#log_state{last_log_info=LastLogInfo}}=State) ->
+    case (VotedFor =:= null orelse VotedFor =:= CandidateId) andalso is_candidate_up_to_date(LastLogInfo, CandidateLastLogInfo) of
         true ->
             send_msg(CandidateId, {response_vote, Self, CurTerm, true}),
             {noreply, convert_to_follower(CurTerm, CandidateId, State)};
@@ -230,32 +229,39 @@ handle_cast({append_entries, Term, LeaderId, _, _, _, _},
     send_msg(LeaderId, {response_entries, Self, CurTerm, false, not_change}),
     {noreply, State};
 handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntries, CommitIndex},
-            #state{status=Status, vote_for=VotedFor, cur_term=CurTerm, self=Self}=State)
+            #state{status=Status, vote_for=VotedFor, cur_term=CurTerm, self=Self, log_state=LogState=#log_state{last_log_info=LastLogInfo}}=State)
   when Term > CurTerm orelse (Term =:= CurTerm andalso Status =/= leader) ->
     % todo ignore repeat msg
     % todo If commitIndex > lastApplied apply to state machine
+    {NewLastLogInfo={NewLastLogIndex, _}, Succ} =
     case log_match(Self, LastLogIndex, LastLogTerm) of
         false ->
-            send_msg(LeaderId, {response_entries, Self, Term, false, unknow});
+            {LastLogInfo, false};
         true ->
-            LastIndex =
             case LogEntries of
                 [] ->
-                    not_change;
-                [{LogIndex, LogTerm, _, _}|_] ->
+                    {LastLogInfo, true};
+                [{LogIndex, _, _, _}|_] ->
                     % If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
-                    delete_conflict_entries(Self, LogIndex, LogTerm),
-                    append_log_entries(Self, LogEntries)
-            end,
-            send_msg(LeaderId, {response_entries, Self, Term, true, LastIndex})
+                    delete_conflict_entries(Self, LastLogInfo, LogIndex),
+                    {append_log_entries(Self, LogEntries), true}
+            end
     end,
+    send_msg(LeaderId, {response_entries, Self, Term, Succ, NewLastLogIndex}),
     NewVotedFor = case Term > CurTerm of true -> null; false -> VotedFor end,
-    {noreply, convert_to_follower(Term, NewVotedFor, LeaderId, State)}; % todo If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+     % todo If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+    {noreply, convert_to_follower(Term, NewVotedFor, LeaderId,
+                                  State#state{log_state=LogState#log_state{last_log_info=NewLastLogInfo}})};
 handle_cast({response_entries, _Server, Term, _, _}, #state{cur_term=CurTerm}=State) when Term > CurTerm ->
     {noreply, convert_to_follower(Term, null, State)};
 handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             #state{status=leader, cur_term=CurTerm, tref=TRef,
-                   servers=Servers, self=Self, log_state=LogState, dedicate_state=DState}=State) ->
+                   servers=Servers, self=Self,
+                   log_state=LogState=#log_state{next_index=NextIndex,
+                                                 match_index=MatchIndex,
+                                                 commit_index=CommitIndex,
+                                                 last_log_info={LastLogIndex, _}},
+                   dedicate_state=DState}=State) ->
     NewLivedServers = sets:add_element(Server, DState#leader_state.lived_servers),
     {NewTRef, NewDState} = 
     case sets:size(NewLivedServers) >= (length(Servers) div 2) of
@@ -271,22 +277,25 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             {NewNext, NewMatch} =
             case FollowerLastIndex of
                 not_change ->
-                    NewN = maps:get(Server, LogState#log_state.next_index),
+                    NewN = maps:get(Server, NextIndex),
                     {NewN, NewN - 1};
-                FollowerLastIndex ->
-                    {FollowerLastIndex + 1, FollowerLastIndex}
+                FollowerLastIndex when FollowerLastIndex =< LastLogIndex ->
+                    {FollowerLastIndex + 1, FollowerLastIndex};
+                % old leader may have more logs
+                _ ->
+                    {LastLogIndex + 1, LastLogIndex}
             end,
-            NewLogState = LogState#log_state{next_index=(LogState#log_state.next_index)#{Server := NewNext},
-                                             match_index=(LogState#log_state.match_index)#{Server := NewMatch}},
+            NewLogState = LogState#log_state{next_index=NextIndex#{Server := NewNext},
+                                             match_index=MatchIndex#{Server := NewMatch}},
             % If there exists an N such that N > commitIndex, a majority of matchIndex[i] >=  N, 
             % and log[N].term == currentTerm: set commitIndex = N
             N = lists:nth(length(Servers) div 2 + 1, lists:sort(maps:values(NewLogState#log_state.match_index))),
             NewCommitIndex =
             case log_info(Self, N) of
-                {N, CurTerm} when N > LogState#log_state.commit_index ->
+                {N, CurTerm} when N > CommitIndex ->
                     N;
                 _ ->
-                    LogState#log_state.commit_index
+                    CommitIndex
             end,
             % apply to state machine
             {NewS, Results} = 
@@ -340,12 +349,12 @@ handle_info({timeout, HRef, heartbeat_timeout}, #state{status=Status,
 handle_info(_Info, State) ->
     {noreply, State}.
 
-convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers}=State) ->
+convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers, log_state=#log_state{last_log_info=LastLogInfo}}=State) ->
     NewTerm = CurTerm + 1,
     log("I am candidate ~p in term ~p~n", [Self, NewTerm]),
     cancel_timers(State),
     save_state(Self, NewTerm, CurTerm, Self, null),
-    [send_msg(Other, {request_vote, NewTerm, Self, last_log_info(Self)}) || Other <- Servers, Other =/= Self],
+    [send_msg(Other, {request_vote, NewTerm, Self, LastLogInfo}) || Other <- Servers, Other =/= Self],
     TRef = erlang:start_timer(rand:uniform(?ELECTION_TIMEOUT) + ?ELECTION_TIMEOUT, self(), election_timeout),
     State#state{status=candidate,
                 vote_for=Self,
@@ -354,10 +363,9 @@ convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers}=State)
                 tref=TRef,
                 dedicate_state=#candidate_state{}}.
 
-convert_to_leader(#state{cur_term=Term, self=Self, servers=Servers, log_state=LogState}=State) ->
+convert_to_leader(#state{cur_term=Term, self=Self, servers=Servers, log_state=LogState=#log_state{last_log_info={LastLogIndex, _}}}=State) ->
     log("I am leader ~p in term ~p~n",[Self, Term]),
     cancel_timers(State),
-    {LastLogIndex, _LastLogTerm} = last_log_info(Self),
     NextIndex = maps:from_list([{Other, LastLogIndex + 1} || Other <- Servers, Other =/= Self]),
     MatchIndex = maps:from_list([{Other, 0} || Other <- Servers, Other =/= Self]),
     NewLogState = LogState#log_state{next_index=NextIndex, match_index=MatchIndex, need_reply=[]},
@@ -395,11 +403,11 @@ cancel_timers(#leader_state{href=HRef}) ->
 cancel_timers(_) ->
     ok.
 
-get_follower_missing_log(Self, Follower, Logstate) ->
-    PrevIndex = maps:get(Follower, Logstate#log_state.next_index) - 1,
+get_follower_missing_log(Self, Follower, #log_state{next_index=NextIndex, last_log_info={LastIndex, _}}) ->
+    PrevIndex = maps:get(Follower, NextIndex) - 1,
     {PrevIndex, PrevTerm} = log_info(Self, PrevIndex),
     % todo control log size for msg
-    LogEntries = get_logs_from(Self, PrevIndex + 1),
+    LogEntries = get_logs_from(Self, PrevIndex + 1, LastIndex),
     {PrevIndex, PrevTerm, LogEntries}.
 
 replicate_one_follower(Term, Self, Follower, LogState) ->
