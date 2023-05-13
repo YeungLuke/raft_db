@@ -48,16 +48,26 @@ who_is_leader(Server) ->
         Server ->
             Server;
         null ->
-            null;
+            no_leader;
         Other ->
             who_is_leader(Other)
     end.
 
+call(Servers, Cmd) when is_list(Servers) ->
+    case who_is_leader(Servers) of
+        no_leader ->
+            {error, no_leader};
+        Leader ->
+            call(Leader, Cmd)
+    end;
+call(Server, Cmd) ->
+    gen_server:call(Server, {cmd, client_sn_todo, Cmd}).
+
 put(Server, Key, Value) ->
-    gen_server:call(Server, {cmd, client_sn_todo, {put, Key, Value}}).
+    call(Server, {put, Key, Value}).
 
 get(Server, Key) ->
-    gen_server:call(Server, {cmd, client_sn_todo, {get, Key}}).
+    call(Server, {get, Key}).
 
 start_link({{Name, Node}=Self, Servers}) when is_atom(Node) ->
     gen_server:start_link({local, Name}, ?MODULE, {Self, Servers}, []);
