@@ -192,7 +192,7 @@ handle_call({cmd, Sn, Cmd}, From, #state{status=leader,
             LastLogInfo = append_log_entries(Self, [{Index, CurTerm, Sn, Cmd}]),
             NewLogState = LogState#log_state{need_reply=[{Index, From}|NeedReply], last_log_info=LastLogInfo},
             NewFollowersInfo = replicate_logs(CurTerm, Self, NewLogState, DState#leader_state.followers_info),
-            log("I am leader ~p in term ~p, I am replicating log index ~p~n",[Self, CurTerm, Index]),
+            % log("I am leader ~p in term ~p, I am replicating log index ~p~n",[Self, CurTerm, Index]),
             {noreply, State#state{log_state=NewLogState,
                                   dedicate_state=DState#leader_state{followers_info=NewFollowersInfo}}};
         _ ->
@@ -286,6 +286,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                    log_state=LogState=#log_state{next_index=NextIndex,
                                                  match_index=MatchIndex,
                                                  commit_index=CommitIndex,
+                                                 last_applied=LastApplied,
                                                  last_log_info={LastLogIndex, _}},
                    dedicate_state=DState=#leader_state{followers_info=FollowersInfo,lived_servers=LivedServers}}=State) ->
     NewLivedServers = sets:add_element(Server, LivedServers),
@@ -326,17 +327,17 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             end,
             % apply to state machine
             {NewS, Results} = 
-            case NewLogState#log_state.last_applied < NewCommitIndex of
+            case LastApplied < NewCommitIndex of
                 true ->
                     apply_to_state_machine(Self, NewLogState#log_state.state_machine,
-                                           NewLogState#log_state.last_applied + 1, NewCommitIndex);
+                                           LastApplied + 1, NewCommitIndex);
                 _ ->
                     {NewLogState#log_state.state_machine, #{}}
             end,
             % reply to client if commitIndex >= index of client
             [gen_server:reply(From, maps:get(Index, Results)) ||
              {Index, From} <- NewLogState#log_state.need_reply,
-             NewCommitIndex >= Index, Index > NewLogState#log_state.last_applied], 
+             NewCommitIndex >= Index, Index > LastApplied], 
             NewNeedReply = [{Index, From} || {Index, From} <- NewLogState#log_state.need_reply, NewCommitIndex < Index],
             % if follower matchindex =/= last, send remain log entries
             NewFollowerInfo = 
@@ -349,6 +350,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             {noreply, State#state{tref=NewTRef,
                                   dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server => NewFollowerInfo}},
                                   log_state=NewLogState#log_state{commit_index=NewCommitIndex,
+                                                                  last_applied=NewCommitIndex,
                                                                   need_reply=NewNeedReply,
                                                                   state_machine=NewS}}};
         false ->
