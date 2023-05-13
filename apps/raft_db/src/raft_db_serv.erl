@@ -2,7 +2,7 @@
 -behaviour(gen_server).
 
 %% API
--export([start/1, stop/1, start_link/1, who_is_leader/1, put/3, get/2]).
+-export([start/1, stop/1, start_link/1, who_is_leader/1, put/3, get/2, delete/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(HEARTBEAT_TIME_INTERVAL, 300).
@@ -73,6 +73,9 @@ put(Server, Key, Value) ->
 
 get(Server, Key) ->
     call(Server, {get, Key}).
+
+delete(Server, Key) ->
+    call(Server, {delete, Key}).
 
 start_link({{Name, Node}=Self, Servers}) when is_atom(Node) ->
     gen_server:start_link({local, Name}, ?MODULE, {Self, Servers}, []);
@@ -325,7 +328,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                 _ ->
                     CommitIndex
             end,
-            % apply to state machine
+            % apply to state machine (todo if too many applies, and reply is empty, just apply some)
             {NewS, Results} = 
             case LastApplied < NewCommitIndex of
                 true ->

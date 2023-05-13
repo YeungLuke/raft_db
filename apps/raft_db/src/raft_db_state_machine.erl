@@ -16,5 +16,7 @@ apply_cmd(S, {get, Key}) ->
             {error, not_found}
     end,
     {S, Result};
+apply_cmd(S, {delete, Key}) ->
+    {maps:remove(Key, S), ok};
 apply_cmd(S, _) ->
     {S,{error, unknow}}.
