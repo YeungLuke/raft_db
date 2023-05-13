@@ -7,9 +7,9 @@
 
 -define(HEARTBEAT_TIME_INTERVAL, 300).
 -define(ELECTION_TIMEOUT, 1000).
--define(MAX_REPLY_SIZE, 100).
--define(MAX_LOG_SIZE, 50).
--define(LOOKUP_LOG_SIZE, 10).
+-define(MAX_REPLY_SIZE, 200).
+-define(MAX_LOG_SIZE, 300).
+-define(LOOKUP_LOG_SIZE, 200).
 
 -record(follower_info, {href=null, last_msg_type=null}).
 
@@ -328,7 +328,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                 _ ->
                     CommitIndex
             end,
-            % apply to state machine (todo if too many applies, and reply is empty, just apply some)
+            % apply to state machine (todo if too many applies, and reply is empty, just apply some, or do apply in another proc)
             {NewS, Results} = 
             case LastApplied < NewCommitIndex of
                 true ->
