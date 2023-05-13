@@ -7,6 +7,9 @@
 
 -define(HEARTBEAT_TIME_INTERVAL, 300).
 -define(ELECTION_TIMEOUT, 1000).
+-define(MAX_REPLY_SIZE, 100).
+-define(MAX_LOG_SIZE, 50).
+-define(LOOKUP_LOG_SIZE, 10).
 
 -record(follower_info, {href=null, last_msg_type=null}).
 
@@ -136,8 +139,13 @@ append_log_entries(Self, LogEntries) ->
 
 get_logs_from(Self, From, To) ->
     Name = name(Self),
-    % todo use select or match rewrite
-    lists:flatten([dets:lookup(Name, I) || I <- lists:seq(max(From, 1), To)]).
+    % todo need test more like big table
+    case (To - From) < ?LOOKUP_LOG_SIZE of
+        true  ->
+            lists:flatten([dets:lookup(Name, I) || I <- lists:seq(max(From, 1), To)]);
+        _ ->
+            lists:sort(dets:select(Name, [{{'$1','_','_','_'}, [{'andalso',{'>=','$1',From},{'=<','$1',To}}], ['$_']}]))
+    end.
 
 apply_to_state_machine(_, S, From, To, Results) when From > To ->
     {S, Results};
@@ -178,17 +186,17 @@ handle_call({cmd, Sn, Cmd}, From, #state{status=leader,
                                          cur_term=CurTerm,
                                          self=Self,
                                          dedicate_state=DState}=State) ->
-    case NeedReply of
-        [] ->
+    case length(NeedReply) < ?MAX_REPLY_SIZE of
+        true ->
             Index = LastLogIndex + 1,
             LastLogInfo = append_log_entries(Self, [{Index, CurTerm, Sn, Cmd}]),
-            NewLogState = LogState#log_state{need_reply=[{Index, From}], last_log_info=LastLogInfo},
+            NewLogState = LogState#log_state{need_reply=[{Index, From}|NeedReply], last_log_info=LastLogInfo},
             NewFollowersInfo = replicate_logs(CurTerm, Self, NewLogState, DState#leader_state.followers_info),
             log("I am leader ~p in term ~p, I am replicating log index ~p~n",[Self, CurTerm, Index]),
             {noreply, State#state{log_state=NewLogState,
                                   dedicate_state=DState#leader_state{followers_info=NewFollowersInfo}}};
         _ ->
-            {reply, todo, State}
+            {reply, {error, too_many_requests}, State}
     end;
 handle_call(stop, _From, #state{self=Self} = State) ->
     dets:close(name(Self)),
@@ -260,7 +268,7 @@ handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntri
     end,
     send_msg(LeaderId, {response_entries, Self, Term, Succ, NewLastLogIndex}),
     NewVotedFor = case Term > CurTerm of true -> null; false -> VotedFor end,
-    % todo If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+    % If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
     NewCommitIndex = 
     case LeaderCommitIndex > CommitIndex of
         true ->
@@ -434,8 +442,8 @@ cancel_timers(_) ->
 get_follower_missing_log(Self, Follower, #log_state{next_index=NextIndex, last_log_info={LastIndex, _}}) ->
     PrevIndex = maps:get(Follower, NextIndex) - 1,
     {PrevIndex, PrevTerm} = log_info(Self, PrevIndex),
-    % todo control log size for msg
-    LogEntries = get_logs_from(Self, PrevIndex + 1, LastIndex),
+    % control log size for msg
+    LogEntries = get_logs_from(Self, PrevIndex + 1, min(PrevIndex + ?MAX_LOG_SIZE, LastIndex)),
     {PrevIndex, PrevTerm, LogEntries}.
 
 replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo=#follower_info{last_msg_type=LastType, href=HRef}) ->
