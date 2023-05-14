@@ -10,7 +10,6 @@
 -define(ELECTION_TIMEOUT, 1000).
 -define(MAX_REPLY_SIZE, 200).
 -define(MAX_LOG_SIZE, 300).
--define(LOOKUP_LOG_SIZE, 200).
 
 -record(follower_info, {href=null, last_msg_type=null}).
 
@@ -27,7 +26,7 @@
                 leader = null,
                 tref,
                 log_state,
-                need_reply=[],
+                need_reply=#{},
                 dedicate_state = #follower_state{}}).
 
 start(Name) ->
@@ -73,47 +72,10 @@ start_link({{Name, Node}=Self, Servers}) when is_atom(Node) ->
 start_link({Self, Servers}) when is_atom(Self) ->
     gen_server:start_link({local, Self}, ?MODULE, {Self, Servers}, []).
 
-name({_Reg, Node}) when is_atom(Node) ->
-    Node;
-name(Self) when is_atom(Self) ->
-    Self.
-
 save_state(Self, NewTerm, OldTerm, NewVotedFor, OldVoteFor) when NewTerm > OldTerm orelse NewVotedFor =/= OldVoteFor ->
     raft_db_log_state:save_vote_info(Self, NewTerm, NewVotedFor);
 save_state(_, _, _, _, _) ->
     ok.
-
-log_info(Self, Index) ->
-    case dets:lookup(name(Self), Index) of
-        [{Index, Term, _, _}] ->
-            {Index, Term};
-        _ ->
-            {0, 0}
-    end.
-
-get_logs_from(Self, From, To) ->
-    Name = name(Self),
-    % todo need test more like big table
-    case (To - From) < ?LOOKUP_LOG_SIZE of
-        true  ->
-            lists:flatten([dets:lookup(Name, I) || I <- lists:seq(max(From, 1), To)]);
-        _ ->
-            lists:sort(dets:select(Name, [{{'$1','_','_','_'}, [{'andalso',{'>=','$1',From},{'=<','$1',To}}], ['$_']}]))
-    end.
-
-apply_to_state_machine(_, S, From, To, Results) when From > To ->
-    {S, Results};
-apply_to_state_machine(Self, S, From, To, Results) ->
-    case dets:lookup(name(Self), From) of
-        [{From, _, _, Cmd}] ->
-            {NewS, Result} = raft_db_state_machine:apply_cmd(S, Cmd),
-            apply_to_state_machine(Self, NewS, From + 1, To, Results#{From => Result});
-        _ ->
-            apply_to_state_machine(Self, S, From + 1, To, Results)
-    end.
-
-apply_to_state_machine(Self, S, From, To) ->
-    apply_to_state_machine(Self, S, From, To, #{}).
 
 is_candidate_up_to_date({CurLastLogIndex, CurLastLogTerm}, {CandidateLastLogIndex, CandidateLastLogTerm}) ->
     CandidateLastLogTerm > CurLastLogTerm orelse 
@@ -134,28 +96,28 @@ handle_call({cmd, Sn, Cmd}, From, #state{status=leader,
                                          self=Self,
                                          need_reply=NeedReply,
                                          dedicate_state=DState}=State) ->
-    case length(NeedReply) < ?MAX_REPLY_SIZE of
+    case maps:size(NeedReply) < ?MAX_REPLY_SIZE of
         true ->
             NewLogState = raft_db_log_state:append_log(LogState, CurTerm, Sn, Cmd),
-            {Index, _} = raft_db_log_state:last_log_info(NewLogState),
+            Index = raft_db_log_state:last_log_index(NewLogState),
             NewFollowersInfo = replicate_logs(CurTerm, Self, NewLogState, DState#leader_state.followers_info),
             log("I am leader ~p in term ~p, I am replicating log index ~p~n",[Self, CurTerm, Index]),
             {noreply, State#state{log_state=NewLogState,
-                                  need_reply=[{Index, From}|NeedReply],
+                                  need_reply=NeedReply#{Index => From},
                                   dedicate_state=DState#leader_state{followers_info=NewFollowersInfo}}};
         _ ->
             {reply, {error, too_many_requests}, State}
     end;
-handle_call(stop, _From, #state{self=Self} = State) ->
-    dets:close(name(Self)),
+handle_call(stop, _From, #state{log_state=LogState} = State) ->
+    raft_db_log_state:close(LogState),
     {stop, normal, stopped, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
 handle_cast({request_vote, Term, CandidateId, CandidateLastLogInfo},
-            #state{cur_term=CurTerm, self=Self, log_state=#log_state{last_log_info=LastLogInfo}}=State)
+            #state{cur_term=CurTerm, self=Self, log_state=LogState}=State)
   when Term > CurTerm ->
-    UpToDate = is_candidate_up_to_date(LastLogInfo, CandidateLastLogInfo),
+    UpToDate = is_candidate_up_to_date(raft_db_log_state:last_log_info(LogState), CandidateLastLogInfo),
     case UpToDate of
         true ->
             send_msg(CandidateId, {response_vote, Self, Term, true}),
@@ -165,8 +127,9 @@ handle_cast({request_vote, Term, CandidateId, CandidateLastLogInfo},
             {noreply, convert_to_follower(Term, null, State)}
     end;
 handle_cast({request_vote, CurTerm, CandidateId, CandidateLastLogInfo},
-            #state{status=follower, vote_for=VotedFor, cur_term=CurTerm, self=Self, log_state=#log_state{last_log_info=LastLogInfo}}=State) ->
-    case (VotedFor =:= null orelse VotedFor =:= CandidateId) andalso is_candidate_up_to_date(LastLogInfo, CandidateLastLogInfo) of
+            #state{status=follower, vote_for=VotedFor, cur_term=CurTerm, self=Self, log_state=LogState}=State) ->
+    case (VotedFor =:= null orelse VotedFor =:= CandidateId) andalso
+            is_candidate_up_to_date(raft_db_log_state:last_log_info(LogState), CandidateLastLogInfo) of
         true ->
             send_msg(CandidateId, {response_vote, Self, CurTerm, true}),
             {noreply, convert_to_follower(CurTerm, CandidateId, State)};
@@ -200,8 +163,7 @@ handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntri
     % todo ignore repeat msg
     % todo If commitIndex > lastApplied apply to state machine
     {NewLogState, Succ} = raft_db_log_state:append_leader_logs(LogState, LastLogIndex, LastLogTerm, LeaderCommitIndex, LogEntries),
-    {NewLastLogIndex, _} = raft_db_log_state:last_log_info(NewLogState),
-    send_msg(LeaderId, {response_entries, Self, Term, Succ, NewLastLogIndex}),
+    send_msg(LeaderId, {response_entries, Self, Term, Succ, raft_db_log_state:last_log_index(NewLogState)}),
     NewVotedFor = case Term > CurTerm of true -> null; false -> VotedFor end,
     {noreply, convert_to_follower(Term, NewVotedFor, LeaderId,
                                   State#state{log_state=NewLogState})};
@@ -211,10 +173,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             #state{status=leader, cur_term=CurTerm, tref=TRef,
                    servers=Servers, self=Self,
                    log_state=LogState=#log_state{next_index=NextIndex,
-                                                 match_index=MatchIndex,
-                                                 commit_index=CommitIndex,
-                                                 last_applied=LastApplied,
-                                                 last_log_info={LastLogIndex, _}},
+                                                 match_index=MatchIndex},
                    need_reply=NeedReply,
                    dedicate_state=DState=#leader_state{followers_info=FollowersInfo,lived_servers=LivedServers}}=State) ->
     NewLivedServers = sets:add_element(Server, LivedServers),
@@ -230,6 +189,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
     case Succ of
         true ->
             % update nextIndex and matchIndex for follwer
+            LastLogIndex = raft_db_log_state:last_log_index(LogState),
             {NewNext, NewMatch} =
             case FollowerLastIndex of
                 not_change ->
@@ -245,28 +205,16 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                                              match_index=MatchIndex#{Server := NewMatch}},
             % If there exists an N such that N > commitIndex, a majority of matchIndex[i] >=  N, 
             % and log[N].term == currentTerm: set commitIndex = N
-            N = lists:nth(length(Servers) div 2 + 1, lists:sort(maps:values(NewLogState#log_state.match_index))),
-            NewCommitIndex =
-            case log_info(Self, N) of
-                {N, CurTerm} when N > CommitIndex ->
-                    N;
-                _ ->
-                    CommitIndex
-            end,
+            MajorityIndex = lists:nth(length(Servers) div 2 + 1,
+                                      lists:sort(maps:values(NewLogState#log_state.match_index))),
             % apply to state machine (todo if too many applies, and reply is empty, just apply some, or do apply in another proc)
-            {NewS, Results} = 
-            case LastApplied < NewCommitIndex of
-                true ->
-                    apply_to_state_machine(Self, NewLogState#log_state.state_machine,
-                                           LastApplied + 1, NewCommitIndex);
-                _ ->
-                    {NewLogState#log_state.state_machine, #{}}
-            end,
+            {NewLogState2, Results} = raft_db_log_state:apply_to_state_machine(NewLogState, MajorityIndex, CurTerm, NeedReply),
             % reply to client if commitIndex >= index of client
-            [gen_server:reply(From, maps:get(Index, Results)) ||
-             {Index, From} <- NeedReply,
-             NewCommitIndex >= Index, Index > LastApplied], 
-            NewNeedReply = [{Index, From} || {Index, From} <- NeedReply, NewCommitIndex < Index],
+            NewNeedReply = maps:fold(fun(Index, V, Reply) ->
+                                        {From, New} = maps:take(Index, Reply),
+                                        gen_server:reply(From, V),
+                                        New
+                                     end, NeedReply, Results),
             % if follower matchindex =/= last, send remain log entries
             NewFollowerInfo = 
             case NewMatch < LastLogIndex of
@@ -278,9 +226,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             {noreply, State#state{tref=NewTRef,
                                   need_reply=NewNeedReply,
                                   dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server => NewFollowerInfo}},
-                                  log_state=NewLogState#log_state{commit_index=NewCommitIndex,
-                                                                  last_applied=NewCommitIndex,
-                                                                  state_machine=NewS}}};
+                                  log_state=NewLogState2}};
         false ->
             % decrement nextIndex and retry
             PrevIndex = maps:get(Server, LogState#log_state.next_index) - 1,
@@ -316,12 +262,13 @@ handle_info({timeout, HRef, {heartbeat_timeout, Follower}},
 handle_info(_Info, State) ->
     {noreply, State}.
 
-convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers, log_state=#log_state{last_log_info=LastLogInfo}}=State) ->
+convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers, log_state=LogState}=State) ->
     NewTerm = CurTerm + 1,
     log("I am candidate ~p in term ~p~n", [Self, NewTerm]),
     cancel_timers(State),
     save_state(Self, NewTerm, CurTerm, Self, null),
-    [send_msg(Other, {request_vote, NewTerm, Self, LastLogInfo}) || Other <- Servers, Other =/= Self],
+    Msg = {request_vote, NewTerm, Self, raft_db_log_state:last_log_info(LogState)},
+    [send_msg(Other, Msg) || Other <- Servers, Other =/= Self],
     TRef = erlang:start_timer(rand:uniform(?ELECTION_TIMEOUT) + ?ELECTION_TIMEOUT, self(), election_timeout),
     State#state{status=candidate,
                 vote_for=Self,
@@ -335,8 +282,7 @@ convert_to_leader(#state{cur_term=Term, self=Self, servers=Servers, log_state=Lo
     cancel_timers(State),
     Followers = Servers -- [Self],
     % todo move follower index to follower info
-    {LastLogIndex, _} = raft_db_log_state:last_log_info(LogState),
-    NextIndex = from_keys(Followers, LastLogIndex + 1),
+    NextIndex = from_keys(Followers, raft_db_log_state:last_log_index(LogState) + 1),
     MatchIndex = from_keys(Followers, 0),
     NewLogState = (raft_db_log_state:append_no_op_log(LogState, Term))#log_state{next_index=NextIndex, match_index=MatchIndex},
     FollowersInfo = send_heartbeat(Term, Self, NewLogState, from_keys(Followers, #follower_info{})),
@@ -368,15 +314,13 @@ convert_to_follower(NewTerm, NewVotedFor, NewLeader, #state{cur_term=OldTerm, vo
                 dedicate_state=#follower_state{}}.
 
 cancel_timers(#state{tref=TRef}) ->
-    erlang:cancel_timer(TRef);
-cancel_timers(_) ->
-    ok.
+    erlang:cancel_timer(TRef).
 
-get_follower_missing_log(Self, Follower, #log_state{next_index=NextIndex, last_log_info={LastIndex, _}}) ->
+get_follower_missing_log(_Self, Follower, LogState=#log_state{next_index=NextIndex}) ->
     PrevIndex = maps:get(Follower, NextIndex) - 1,
-    {PrevIndex, PrevTerm} = log_info(Self, PrevIndex),
+    {PrevIndex, PrevTerm} = raft_db_log_state:log_info(LogState, PrevIndex),
     % control log size for msg
-    LogEntries = get_logs_from(Self, PrevIndex + 1, min(PrevIndex + ?MAX_LOG_SIZE, LastIndex)),
+    LogEntries = raft_db_log_state:get_logs_from(LogState, PrevIndex + 1, ?MAX_LOG_SIZE),
     {PrevIndex, PrevTerm, LogEntries}.
 
 replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo=#follower_info{last_msg_type=LastType, href=HRef}) ->
@@ -386,7 +330,7 @@ replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo=#follower_in
         _ ->
             case is_reference(HRef) of true -> erlang:cancel_timer(HRef); _ -> ok end,
             {PrevIndex, PrevTerm, LogEntries} = get_follower_missing_log(Self, Follower, LogState),
-            Msg = {append_entries, Term, Self, PrevIndex, PrevTerm, LogEntries, LogState#log_state.commit_index},
+            Msg = {append_entries, Term, Self, PrevIndex, PrevTerm, LogEntries, raft_db_log_state:commit_index(LogState)},
             send_msg(Follower, Msg),
             % todo calc timeout by msg length
             MsgType = case LogEntries of [] -> heartbeat; _ -> normal end,
