@@ -1,5 +1,6 @@
 -module(raft_db_serv).
 -behaviour(gen_server).
+-include("./raft_db_log_state.hrl").
 
 %% API
 -export([start/1, stop/1, start_link/1, who_is_leader/1, put/3, get/2, delete/2]).
@@ -18,17 +19,6 @@
 -record(leader_state, {followers_info = #{},
                        lived_servers = sets:new()}).
 
--record(log_state, {state_machine=raft_db_state_machine:new(),
-                    % Volatile state on all servers:
-                    commit_index=0, % index of highest log entry known to be committed (initialized to 0, increases monotonically)
-                    last_applied=0, % index of highest log entry applied to state machine (initialized to 0, increases monotonically)
-                    % Volatile state on leaders
-                    next_index=#{}, % for each server, index of the next log entry to send to that server (initialized to leader last log index + 1)
-                    match_index=#{}, % for each server, index of highest log entry known to be replicated on server (initialized to 0, increases monotonically)
-                    % Other
-                    need_reply=[],
-                    last_log_info={0, 0}}).
-
 -record(state, {status = follower,
                 vote_for = null, % candidateId that received vote in current term (or null if none)
                 cur_term = 0, % latest term server has seen (initialized to 0 on first boot, increases monotonically)
@@ -36,7 +26,8 @@
                 servers,
                 leader = null,
                 tref,
-                log_state=#log_state{},
+                log_state,
+                need_reply=[],
                 dedicate_state = #follower_state{}}).
 
 start(Name) ->
@@ -87,27 +78,10 @@ name({_Reg, Node}) when is_atom(Node) ->
 name(Self) when is_atom(Self) ->
     Self.
 
-file_name(Self) ->
-    atom_to_list(name(Self)) ++ ".db".
-
-load_state(Self) ->
-    Name = name(Self),
-    FileName = file_name(Self),
-    {ok, Name} = dets:open_file(Name, [{file, FileName}]),
-    {vote_info(Self), last_log_info(Self)}.
-
 save_state(Self, NewTerm, OldTerm, NewVotedFor, OldVoteFor) when NewTerm > OldTerm orelse NewVotedFor =/= OldVoteFor ->
-    dets:insert(name(Self), {state, NewTerm, NewVotedFor});
+    raft_db_log_state:save_vote_info(Self, NewTerm, NewVotedFor);
 save_state(_, _, _, _, _) ->
     ok.
-
-vote_info(Self) ->
-    case dets:lookup(name(Self), state) of
-        [{state, Term, VotedFor}] ->
-            {Term, VotedFor};
-        _ ->
-            {0, null}
-    end.
 
 log_info(Self, Index) ->
     case dets:lookup(name(Self), Index) of
@@ -116,29 +90,6 @@ log_info(Self, Index) ->
         _ ->
             {0, 0}
     end.
-
-last_log_info(Self) ->
-    case dets:lookup(name(Self), last) of
-        [{last, Index}] ->
-            log_info(Self, Index);
-        _ ->
-            {0, 0}
-    end.
-
-log_match(_Self, 0, _) ->
-    true;
-log_match(Self, Index, Term) ->
-    case dets:lookup(name(Self), Index) of
-        [{Index, Term, _, _}] ->
-            true;
-        _ ->
-            false
-    end.
-
-append_log_entries(Self, LogEntries) ->
-    {LastLogIndex, LastLogTerm, _, _} = lists:last(LogEntries),
-    dets:insert(name(Self), LogEntries ++ [{last, LastLogIndex}]),
-    {LastLogIndex, LastLogTerm}.
 
 get_logs_from(Self, From, To) ->
     Name = name(Self),
@@ -164,39 +115,33 @@ apply_to_state_machine(Self, S, From, To, Results) ->
 apply_to_state_machine(Self, S, From, To) ->
     apply_to_state_machine(Self, S, From, To, #{}).
 
-delete_conflict_entries(Self, {LastLogIndex, _}, Index) when Index =< LastLogIndex ->
-    Name = name(Self),
-    dets:insert(Name, {last, LastLogIndex - 1});
-    % [dets:delete(Name, I) || I <- lists:seq(Index, LastLogIndex)];
-delete_conflict_entries(_, _, _) ->
-    ok.
-
 is_candidate_up_to_date({CurLastLogIndex, CurLastLogTerm}, {CandidateLastLogIndex, CandidateLastLogTerm}) ->
     CandidateLastLogTerm > CurLastLogTerm orelse 
         (CandidateLastLogTerm =:= CurLastLogTerm andalso CandidateLastLogIndex >= CurLastLogIndex).
 
 init({Self, Servers}) ->
-    {{Term, VotedFor}, LastLogInfo} = load_state(Self),
+    {{Term, VotedFor}, LogState} = raft_db_log_state:load_state(Self),
     log("I am follower ~p in term ~p~n", [Self, Term]),
     TRef = erlang:start_timer(rand:uniform(?ELECTION_TIMEOUT) + ?ELECTION_TIMEOUT, self(), election_timeout),
     {ok, #state{vote_for=VotedFor, cur_term=Term, self=Self, servers=Servers, tref=TRef,
-                log_state=#log_state{last_log_info=LastLogInfo}}}.
+                log_state=LogState}}.
 
 handle_call(who_is_leader, _From, State) ->
     {reply, State#state.leader, State};
 handle_call({cmd, Sn, Cmd}, From, #state{status=leader,
-                                         log_state=LogState=#log_state{last_log_info={LastLogIndex, _}, need_reply=NeedReply},
+                                         log_state=LogState,
                                          cur_term=CurTerm,
                                          self=Self,
+                                         need_reply=NeedReply,
                                          dedicate_state=DState}=State) ->
     case length(NeedReply) < ?MAX_REPLY_SIZE of
         true ->
-            Index = LastLogIndex + 1,
-            LastLogInfo = append_log_entries(Self, [{Index, CurTerm, Sn, Cmd}]),
-            NewLogState = LogState#log_state{need_reply=[{Index, From}|NeedReply], last_log_info=LastLogInfo},
+            NewLogState = raft_db_log_state:append_log(LogState, CurTerm, Sn, Cmd),
+            {Index, _} = raft_db_log_state:last_log_info(NewLogState),
             NewFollowersInfo = replicate_logs(CurTerm, Self, NewLogState, DState#leader_state.followers_info),
-            % log("I am leader ~p in term ~p, I am replicating log index ~p~n",[Self, CurTerm, Index]),
+            log("I am leader ~p in term ~p, I am replicating log index ~p~n",[Self, CurTerm, Index]),
             {noreply, State#state{log_state=NewLogState,
+                                  need_reply=[{Index, From}|NeedReply],
                                   dedicate_state=DState#leader_state{followers_info=NewFollowersInfo}}};
         _ ->
             {reply, {error, too_many_requests}, State}
@@ -250,37 +195,16 @@ handle_cast({append_entries, Term, LeaderId, _, _, _, _},
     send_msg(LeaderId, {response_entries, Self, CurTerm, false, not_change}),
     {noreply, State};
 handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntries, LeaderCommitIndex},
-            #state{status=Status, vote_for=VotedFor, cur_term=CurTerm, self=Self,
-                   log_state=LogState=#log_state{last_log_info=LastLogInfo, commit_index=CommitIndex}}=State)
+            #state{status=Status, vote_for=VotedFor, cur_term=CurTerm, self=Self, log_state=LogState}=State)
   when Term > CurTerm orelse (Term =:= CurTerm andalso Status =/= leader) ->
     % todo ignore repeat msg
     % todo If commitIndex > lastApplied apply to state machine
-    {NewLastLogInfo={NewLastLogIndex, _}, Succ} =
-    case log_match(Self, LastLogIndex, LastLogTerm) of
-        false ->
-            {LastLogInfo, false};
-        true ->
-            case LogEntries of
-                [] ->
-                    {LastLogInfo, true};
-                [{LogIndex, _, _, _}|_] ->
-                    % If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
-                    delete_conflict_entries(Self, LastLogInfo, LogIndex),
-                    {append_log_entries(Self, LogEntries), true}
-            end
-    end,
+    {NewLogState, Succ} = raft_db_log_state:append_leader_logs(LogState, LastLogIndex, LastLogTerm, LeaderCommitIndex, LogEntries),
+    {NewLastLogIndex, _} = raft_db_log_state:last_log_info(NewLogState),
     send_msg(LeaderId, {response_entries, Self, Term, Succ, NewLastLogIndex}),
     NewVotedFor = case Term > CurTerm of true -> null; false -> VotedFor end,
-    % If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-    NewCommitIndex = 
-    case LeaderCommitIndex > CommitIndex of
-        true ->
-            min(LeaderCommitIndex, NewLastLogIndex);
-        false ->
-            CommitIndex
-    end,
     {noreply, convert_to_follower(Term, NewVotedFor, LeaderId,
-                                  State#state{log_state=LogState#log_state{last_log_info=NewLastLogInfo, commit_index=NewCommitIndex}})};
+                                  State#state{log_state=NewLogState})};
 handle_cast({response_entries, _Server, Term, _, _}, #state{cur_term=CurTerm}=State) when Term > CurTerm ->
     {noreply, convert_to_follower(Term, null, State)};
 handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
@@ -291,6 +215,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                                                  commit_index=CommitIndex,
                                                  last_applied=LastApplied,
                                                  last_log_info={LastLogIndex, _}},
+                   need_reply=NeedReply,
                    dedicate_state=DState=#leader_state{followers_info=FollowersInfo,lived_servers=LivedServers}}=State) ->
     NewLivedServers = sets:add_element(Server, LivedServers),
     {NewTRef, NewDState} = 
@@ -339,9 +264,9 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             end,
             % reply to client if commitIndex >= index of client
             [gen_server:reply(From, maps:get(Index, Results)) ||
-             {Index, From} <- NewLogState#log_state.need_reply,
+             {Index, From} <- NeedReply,
              NewCommitIndex >= Index, Index > LastApplied], 
-            NewNeedReply = [{Index, From} || {Index, From} <- NewLogState#log_state.need_reply, NewCommitIndex < Index],
+            NewNeedReply = [{Index, From} || {Index, From} <- NeedReply, NewCommitIndex < Index],
             % if follower matchindex =/= last, send remain log entries
             NewFollowerInfo = 
             case NewMatch < LastLogIndex of
@@ -351,10 +276,10 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
                     FollowerInfo
             end,
             {noreply, State#state{tref=NewTRef,
+                                  need_reply=NewNeedReply,
                                   dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server => NewFollowerInfo}},
                                   log_state=NewLogState#log_state{commit_index=NewCommitIndex,
                                                                   last_applied=NewCommitIndex,
-                                                                  need_reply=NewNeedReply,
                                                                   state_machine=NewS}}};
         false ->
             % decrement nextIndex and retry
@@ -405,18 +330,20 @@ convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers, log_st
                 tref=TRef,
                 dedicate_state=#candidate_state{}}.
 
-convert_to_leader(#state{cur_term=Term, self=Self, servers=Servers, log_state=LogState=#log_state{last_log_info={LastLogIndex, _}}}=State) ->
+convert_to_leader(#state{cur_term=Term, self=Self, servers=Servers, log_state=LogState}=State) ->
     log("I am leader ~p in term ~p~n",[Self, Term]),
     cancel_timers(State),
     Followers = Servers -- [Self],
+    % todo move follower index to follower info
+    {LastLogIndex, _} = raft_db_log_state:last_log_info(LogState),
     NextIndex = from_keys(Followers, LastLogIndex + 1),
     MatchIndex = from_keys(Followers, 0),
-    NewLastLogInfo = append_log_entries(Self, [{LastLogIndex + 1, Term, null, {no_op}}]),
-    NewLogState = LogState#log_state{next_index=NextIndex, match_index=MatchIndex, need_reply=[], last_log_info=NewLastLogInfo},
+    NewLogState = (raft_db_log_state:append_no_op_log(LogState, Term))#log_state{next_index=NextIndex, match_index=MatchIndex},
     FollowersInfo = send_heartbeat(Term, Self, NewLogState, from_keys(Followers, #follower_info{})),
     TRef = erlang:start_timer(?ELECTION_TIMEOUT, self(), election_timeout),
     State#state{status=leader, tref=TRef, leader=Self,
-                dedicate_state=#leader_state{followers_info=FollowersInfo}, log_state=NewLogState}.
+                dedicate_state=#leader_state{followers_info=FollowersInfo},
+                log_state=NewLogState}.
 
 convert_to_follower(NewTerm, NewVotedFor, State) ->
     convert_to_follower(NewTerm, NewVotedFor, null, State).
