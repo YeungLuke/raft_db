@@ -1,17 +1,13 @@
 -module(raft_db_serv).
 -behaviour(gen_server).
--include("./raft_db_log_state.hrl").
 
 %% API
 -export([start/1, stop/1, start_link/1, who_is_leader/1, put/3, get/2, delete/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
--define(HEARTBEAT_TIME_INTERVAL, 300).
 -define(ELECTION_TIMEOUT, 1000).
 -define(MAX_REPLY_SIZE, 200).
 -define(MAX_LOG_SIZE, 300).
-
--record(follower_info, {href=null, last_msg_type=null}).
 
 -record(follower_state, {}).
 -record(candidate_state, {votes = sets:new()}).
@@ -172,10 +168,10 @@ handle_cast({response_entries, _Server, Term, _, _}, #state{cur_term=CurTerm}=St
 handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             #state{status=leader, cur_term=CurTerm, tref=TRef,
                    servers=Servers, self=Self,
-                   log_state=LogState=#log_state{next_index=NextIndex,
-                                                 match_index=MatchIndex},
+                   log_state=LogState,
                    need_reply=NeedReply,
-                   dedicate_state=DState=#leader_state{followers_info=FollowersInfo,lived_servers=LivedServers}}=State) ->
+                   dedicate_state=DState=#leader_state{followers_info=FollowersInfo,
+                                                       lived_servers=LivedServers}}=State) ->
     NewLivedServers = sets:add_element(Server, LivedServers),
     {NewTRef, NewDState} = 
     case sets:size(NewLivedServers) >= (length(Servers) div 2) of
@@ -185,61 +181,41 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
         _ ->
             {TRef, DState#leader_state{lived_servers=NewLivedServers}}
     end,
-    FollowerInfo = (maps:get(Server, FollowersInfo))#follower_info{last_msg_type=null},
+    FollowerInfo1 = raft_db_follower_info:reponced((maps:get(Server, FollowersInfo))),
     case Succ of
         true ->
-            % update nextIndex and matchIndex for follwer
+            % update nextIndex and matchIndex for follower
             LastLogIndex = raft_db_log_state:last_log_index(LogState),
-            {NewNext, NewMatch} =
-            case FollowerLastIndex of
-                not_change ->
-                    NewN = maps:get(Server, NextIndex),
-                    {NewN, NewN - 1};
-                FollowerLastIndex when FollowerLastIndex =< LastLogIndex ->
-                    {FollowerLastIndex + 1, FollowerLastIndex};
-                % old leader may have more logs
-                _ ->
-                    {LastLogIndex + 1, LastLogIndex}
-            end,
-            NewLogState = LogState#log_state{next_index=NextIndex#{Server := NewNext},
-                                             match_index=MatchIndex#{Server := NewMatch}},
+            FollowerInfo2 = raft_db_follower_info:update_index(FollowerInfo1, FollowerLastIndex, LastLogIndex),
             % If there exists an N such that N > commitIndex, a majority of matchIndex[i] >=  N, 
             % and log[N].term == currentTerm: set commitIndex = N
-            MajorityIndex = lists:nth(length(Servers) div 2 + 1,
-                                      lists:sort(maps:values(NewLogState#log_state.match_index))),
+            MajorityIndex = raft_db_follower_info:majority_index(FollowersInfo),
             % apply to state machine (todo if too many applies, and reply is empty, just apply some, or do apply in another proc)
-            {NewLogState2, Results} = raft_db_log_state:apply_to_state_machine(NewLogState, MajorityIndex, CurTerm, NeedReply),
+            {NewLogState, Results} = raft_db_log_state:apply_to_state_machine(LogState, MajorityIndex, CurTerm, NeedReply),
             % reply to client if commitIndex >= index of client
             NewNeedReply = maps:fold(fun(Index, V, Reply) ->
                                         {From, New} = maps:take(Index, Reply),
                                         gen_server:reply(From, V),
                                         New
                                      end, NeedReply, Results),
-            % if follower matchindex =/= last, send remain log entries
-            NewFollowerInfo = 
-            case NewMatch < LastLogIndex of
+            % if follower matchindex < last, send remain log entries
+            FollowerInfo3 = 
+            case raft_db_follower_info:is_up_to_date(FollowerInfo2, LastLogIndex) of
                 true ->
-                    replicate_one_follower(CurTerm, Self, Server, LogState, FollowerInfo);
+                    replicate_one_follower(CurTerm, Self, Server, LogState, FollowerInfo2);
                 _ ->
-                    FollowerInfo
+                    FollowerInfo2
             end,
             {noreply, State#state{tref=NewTRef,
                                   need_reply=NewNeedReply,
-                                  dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server => NewFollowerInfo}},
-                                  log_state=NewLogState2}};
+                                  dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server := FollowerInfo3}},
+                                  log_state=NewLogState}};
         false ->
             % decrement nextIndex and retry
-            PrevIndex = maps:get(Server, LogState#log_state.next_index) - 1,
-            NewLogState =
-            case PrevIndex > 0 of
-                true ->
-                    LogState#log_state{next_index=(LogState#log_state.next_index)#{Server := PrevIndex}};
-                _ ->
-                    LogState
-            end,
-            NewFollowerInfo = replicate_one_follower(CurTerm, Self, Server, LogState, FollowerInfo),
-            {noreply, State#state{tref=NewTRef, log_state=NewLogState,
-                                  dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server => NewFollowerInfo}}}}
+            FollowerInfo2 = raft_db_follower_info:decrement_next_index(FollowerInfo1),
+            FollowerInfo3 = replicate_one_follower(CurTerm, Self, Server, LogState, FollowerInfo2),
+            {noreply, State#state{tref=NewTRef,
+                                  dedicate_state=NewDState#leader_state{followers_info=FollowersInfo#{Server := FollowerInfo3}}}}
     end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -252,9 +228,11 @@ handle_info({timeout, TRef, election_timeout}, #state{tref=TRef}=State) ->
 handle_info({timeout, HRef, {heartbeat_timeout, Follower}},
             #state{status=leader, cur_term=CurTerm, self=Self, log_state=LogState,
                    dedicate_state=DState=#leader_state{followers_info=FollowersInfo}}=State) ->
-    case FollowersInfo of
-        #{Follower := FollowerInfo=#follower_info{href=HRef}} ->
-            NewFollowerInfo = replicate_one_follower(CurTerm, Self, Follower, LogState, FollowerInfo#follower_info{href=null}),
+    FollowerInfo = maps:get(Follower, FollowersInfo),
+    case raft_db_follower_info:is_cur_href(FollowerInfo, HRef) of
+        true ->
+            NewFollowerInfo = replicate_one_follower(CurTerm, Self, Follower, LogState,
+                                                     raft_db_follower_info:timeout(FollowerInfo)),
             {noreply, State#state{dedicate_state=DState#leader_state{followers_info=FollowersInfo#{Follower => NewFollowerInfo}}}};
         _ ->
             {noreply, State}
@@ -281,11 +259,9 @@ convert_to_leader(#state{cur_term=Term, self=Self, servers=Servers, log_state=Lo
     log("I am leader ~p in term ~p~n",[Self, Term]),
     cancel_timers(State),
     Followers = Servers -- [Self],
-    % todo move follower index to follower info
-    NextIndex = from_keys(Followers, raft_db_log_state:last_log_index(LogState) + 1),
-    MatchIndex = from_keys(Followers, 0),
-    NewLogState = (raft_db_log_state:append_no_op_log(LogState, Term))#log_state{next_index=NextIndex, match_index=MatchIndex},
-    FollowersInfo = send_heartbeat(Term, Self, NewLogState, from_keys(Followers, #follower_info{})),
+    NewLogState = raft_db_log_state:append_no_op_log(LogState, Term),
+    FollowersInfo = send_heartbeat(Term, Self, NewLogState,
+                                   raft_db_follower_info:new(Followers, raft_db_log_state:last_log_index(LogState))),
     TRef = erlang:start_timer(?ELECTION_TIMEOUT, self(), election_timeout),
     State#state{status=leader, tref=TRef, leader=Self,
                 dedicate_state=#leader_state{followers_info=FollowersInfo},
@@ -316,26 +292,22 @@ convert_to_follower(NewTerm, NewVotedFor, NewLeader, #state{cur_term=OldTerm, vo
 cancel_timers(#state{tref=TRef}) ->
     erlang:cancel_timer(TRef).
 
-get_follower_missing_log(_Self, Follower, LogState=#log_state{next_index=NextIndex}) ->
-    PrevIndex = maps:get(Follower, NextIndex) - 1,
+get_follower_missing_log(FollowerInfo, LogState) ->
+    PrevIndex = raft_db_follower_info:next_index(FollowerInfo) - 1,
     {PrevIndex, PrevTerm} = raft_db_log_state:log_info(LogState, PrevIndex),
     % control log size for msg
     LogEntries = raft_db_log_state:get_logs_from(LogState, PrevIndex + 1, ?MAX_LOG_SIZE),
     {PrevIndex, PrevTerm, LogEntries}.
 
-replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo=#follower_info{last_msg_type=LastType, href=HRef}) ->
-    case LastType =:= normal andalso is_reference(HRef) of
+replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo) ->
+    case raft_db_follower_info:replicate_not_responced(FollowerInfo) of
         true ->
             FollowerInfo;
         _ ->
-            case is_reference(HRef) of true -> erlang:cancel_timer(HRef); _ -> ok end,
-            {PrevIndex, PrevTerm, LogEntries} = get_follower_missing_log(Self, Follower, LogState),
+            {PrevIndex, PrevTerm, LogEntries} = get_follower_missing_log(FollowerInfo, LogState),
             Msg = {append_entries, Term, Self, PrevIndex, PrevTerm, LogEntries, raft_db_log_state:commit_index(LogState)},
             send_msg(Follower, Msg),
-            % todo calc timeout by msg length
-            MsgType = case LogEntries of [] -> heartbeat; _ -> normal end,
-            NewHRef = erlang:start_timer(?HEARTBEAT_TIME_INTERVAL, self(), {heartbeat_timeout, Follower}),
-            FollowerInfo#follower_info{last_msg_type=MsgType, href=NewHRef}
+            raft_db_follower_info:update_replicate_info(FollowerInfo, Follower, LogEntries)
     end.
 
 send_heartbeat(Term, Self, LogState, FollowersInfo) ->
@@ -345,10 +317,6 @@ replicate_logs(Term, Self, LogState, FollowersInfo) ->
     % todo get follower missing Log can cache
     maps:map(fun(Follower, FollowerInfo) -> replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo) end,
              FollowersInfo).
-
-% not exist in otp 20
-from_keys(Keys, Value) ->
-    maps:from_list([{Key, Value} || Key <- Keys]).
 
 log(Format, Args) ->
     io:format(Format, Args).
