@@ -9,9 +9,9 @@ apply_cmd(S, {put, Key, Value}) ->
     {S#{Key => Value}, ok};
 apply_cmd(S, {get, Key}) ->
     Result =
-    case maps:is_key(Key, S) of
-        true ->
-            {ok, maps:get(Key, S)};
+    case maps:find(Key, S) of
+        {ok, Value} ->
+            {ok, Value};
         _ ->
             {error, not_found}
     end,

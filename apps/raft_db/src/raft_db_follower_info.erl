@@ -22,19 +22,11 @@ new(Followers, LeaderLastIndex)->
 from_keys(Keys, Value) ->
     maps:from_list([{Key, Value} || Key <- Keys]).
 
-update_index(FollowerInfo, FollowerLastIndex, LastLogIndex) ->
-    {NewNext, NewMatch} =
-    case FollowerLastIndex of
-        not_change ->
-            NextIndex = FollowerInfo#follower_info.next_index,
-            {NextIndex, NextIndex - 1};
-        FollowerLastIndex when FollowerLastIndex =< LastLogIndex ->
-            {FollowerLastIndex + 1, FollowerLastIndex};
-        % old leader may have more logs
-        _ ->
-            {LastLogIndex + 1, LastLogIndex}
-    end,
-    FollowerInfo#follower_info{next_index=NewNext, match_index=NewMatch}.
+update_index(FollowerInfo, FollowerLastIndex, LastLogIndex) when FollowerLastIndex =< LastLogIndex ->
+    FollowerInfo#follower_info{next_index=FollowerLastIndex + 1, match_index=FollowerLastIndex};
+% old leader may have more logs
+update_index(FollowerInfo, _, LastLogIndex) ->
+    FollowerInfo#follower_info{next_index=LastLogIndex + 1, match_index=LastLogIndex}.
 
 majority_index(FollowersInfo) ->
     lists:nth(maps:size(FollowersInfo) div 2 + 1,

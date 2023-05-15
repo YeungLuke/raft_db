@@ -141,8 +141,8 @@ handle_cast({response_vote, Server, CurTerm, true}, #state{status=candidate,
             {noreply, State#state{dedicate_state=DState#candidate_state{votes=NewVotes}}}
     end;
 handle_cast({append_entries, Term, LeaderId, _, _, _, _},
-            #state{cur_term=CurTerm, self=Self}=State) when Term < CurTerm ->
-    send_msg(LeaderId, {response_entries, Self, CurTerm, false, not_change}),
+            #state{cur_term=CurTerm, self=Self, log_state=LogState}=State) when Term < CurTerm ->
+    send_msg(LeaderId, {response_entries, Self, CurTerm, false, raft_db_log_state:last_log_index(LogState)}),
     {noreply, State};
 handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntries, LeaderCommitIndex},
             #state{status=Status, vote_for=VotedFor, cur_term=CurTerm, self=Self, log_state=LogState}=State)

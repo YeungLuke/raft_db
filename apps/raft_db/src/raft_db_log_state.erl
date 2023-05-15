@@ -7,6 +7,7 @@
          apply_to_state_machine/4]).
 
 -define(LOOKUP_LOG_SIZE, 200).
+-define(CACHE_SIZE, 1000).
 
 -record(log_state, {name,
                     state_machine=raft_db_state_machine:new(),
@@ -36,16 +37,6 @@ load_vote_info(Name) ->
 save_vote_info(Self, Term, VotedFor) ->
     dets:insert(name(Self), {state, Term, VotedFor}).
 
-log_info(#log_state{name=Name}, Index) ->
-    log_info(Name, Index);
-log_info(Name, Index) ->
-    case dets:lookup(Name, Index) of
-        [{Index, Term, _, _}] ->
-            {Index, Term};
-        _ ->
-            {0, 0}
-    end.
-
 load_last_log_info(Name) ->
     case dets:lookup(Name, last) of
         [{last, Index}] ->
@@ -54,17 +45,7 @@ load_last_log_info(Name) ->
             {0, 0}
     end.
 
-log_match(_, 0, _) ->
-    true;
-log_match(Name, Index, Term) ->
-    case dets:lookup(Name, Index) of
-        [{Index, Term, _, _}] ->
-            true;
-        _ ->
-            false
-    end.
-
-get_logs_in_range(#log_state{name=Name}, From, To) ->
+load_logs_in_range(Name, From, To) ->
     % todo need test more like big table
     % io:format("~p get logs ~p to ~p~n", [Name, From, To]),
     case (To - From) < ?LOOKUP_LOG_SIZE of
@@ -74,17 +55,66 @@ get_logs_in_range(#log_state{name=Name}, From, To) ->
             lists:sort(dets:select(Name, [{{'$1','_','_','_'}, [{'andalso',{'>=','$1',From},{'=<','$1',To}}], ['$_']}]))
     end.
 
-get_logs_from(LogState=#log_state{last_log_info={LastIndex, _}}, From, MaxSize) ->
-    get_logs_in_range(LogState, max(From, 1), min(From + MaxSize - 1, LastIndex)).
+load_to_cache(Name, {LastLogIndex, _}) ->
+    LogEntries = load_logs_in_range(Name, max(LastLogIndex - ?CACHE_SIZE, 1), LastLogIndex),
+    maps:from_list([{Index, L} || L={Index, _, _, _} <- LogEntries]).
 
 load_state(Self) ->
     Name = name(Self),
     FileName = file_name(Self),
     {ok, Name} = dets:open_file(Name, [{file, FileName}]),
-    {load_vote_info(Self), #log_state{name=Name,last_log_info=load_last_log_info(Name)}}.
+    LastLogInfo = load_last_log_info(Name),
+    {load_vote_info(Self), #log_state{name=Name,
+                                      last_log_info=LastLogInfo,
+                                      cache=load_to_cache(Name, LastLogInfo)}}.
 
 close(#log_state{name=Name}) ->
     dets:close(Name).
+
+log_info(#log_state{name=Name, cache=Cache}, Index) ->
+    case maps:find(Index, Cache) of
+        {ok, {Index, Term, _, _}} ->
+            {Index, Term};
+        _ ->
+            log_info(Name, Index)
+    end;
+log_info(Name, Index) ->
+    case dets:lookup(Name, Index) of
+        [{Index, Term, _, _}] ->
+            {Index, Term};
+        _ ->
+            {0, 0}
+    end.
+
+log_match(_, 0, _) ->
+    true;
+log_match(#log_state{name=Name, cache=Cache}, Index, Term) ->
+    case maps:find(Index, Cache) of
+        {ok, {Index, Term, _, _}} ->
+            true;
+        {ok, _} ->
+            false;
+        _ ->
+            log_match(Name, Index, Term)
+    end;
+log_match(Name, Index, Term) ->
+    case dets:lookup(Name, Index) of
+        [{Index, Term, _, _}] ->
+            true;
+        _ ->
+            false
+    end.
+
+get_logs_in_range(#log_state{name=Name, cache=Cache}, From, To) ->
+    case maps:find(From, Cache) of
+        {ok, Log} ->
+            [Log] ++ [maps:get(N, Cache) || N <- lists:seq(From + 1, To)];
+        _ ->
+            load_logs_in_range(Name, From, To)
+    end.
+
+get_logs_from(LogState=#log_state{last_log_info={LastIndex, _}}, From, MaxSize) ->
+    get_logs_in_range(LogState, max(From, 1), min(From + MaxSize - 1, LastIndex)).
 
 last_log_info(LogState) ->
     LogState#log_state.last_log_info.
@@ -95,11 +125,14 @@ last_log_index(#log_state{last_log_info={LastLogIndex, _}}) ->
 commit_index(LogState) ->
     LogState#log_state.commit_index.
 
-delete_conflict_entries(Name, {LastLogIndex, _}, Index) when Index =< LastLogIndex ->
-    dets:insert(Name, {last, LastLogIndex - 1});
-    % [dets:delete(Name, I) || I <- lists:seq(Index, LastLogIndex)];
-delete_conflict_entries(_, _, _) ->
-    ok.
+delete_conflict_entries(LogState=#log_state{name=Name, cache=Cache, last_log_info={LastLogIndex, Term}},
+                        Index) when Index =< LastLogIndex ->
+    dets:insert(Name, {last, Index - 1}),
+    % [dets:delete(Name, I) || I <- lists:seq(Index, LastLogIndex)],
+    % term is wrong, but it will be overwrite in append_log_entries immediately
+    LogState#log_state{last_log_info={Index - 1, Term}, cache=maps:without(lists:seq(Index, LastLogIndex), Cache)};
+delete_conflict_entries(LogState, _) ->
+    LogState.
 
 append_log(LogState=#log_state{last_log_info={LastLogIndex, _}}, Term, Sn, Cmd) ->
     Index = LastLogIndex + 1,
@@ -108,37 +141,46 @@ append_log(LogState=#log_state{last_log_info={LastLogIndex, _}}, Term, Sn, Cmd) 
 append_no_op_log(LogState, Term) ->
     append_log(LogState, Term, null, {no_op}).
 
+% If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 update_follower_commit_index(LeaderCommitIndex, CommitIndex, LastLogIndex) when LeaderCommitIndex > CommitIndex ->
     min(LeaderCommitIndex, LastLogIndex);
 update_follower_commit_index(_, CommitIndex, _) ->
     CommitIndex.
 
-append_leader_logs(LogState=#log_state{name=Name, last_log_info=LastLogInfo, commit_index=CommitIndex},
+append_leader_logs(LogState=#log_state{commit_index=CommitIndex},
                    LeaderLastIndex, LeaderLastTerm, LeaderCommitIndex, LogEntries) ->
-    case log_match(Name, LeaderLastIndex, LeaderLastTerm) of
-        false ->
+    case {log_match(LogState, LeaderLastIndex, LeaderLastTerm), LogEntries} of
+        {false, _} ->
             {LogState, false};
-        true ->
-            NewLogState =
-            case LogEntries of
-                [] ->
-                    LogState;
-                [{LogIndex, _, _, _}|_] ->
-                    % If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
-                    delete_conflict_entries(Name, LastLogInfo, LogIndex),
-                    append_log_entries(LogState, LogEntries)
-            end,
-            % If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+        {true, []} ->
+            NewCommitIndex = update_follower_commit_index(LeaderCommitIndex, CommitIndex, last_log_info(LogState)),
+            {LogState#log_state{commit_index=NewCommitIndex}, true};
+        {true, [{LogIndex, _, _, _}|_]} ->
+            % If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+            LogState1 = delete_conflict_entries(LogState, LogIndex),
+            NewLogState = append_log_entries(LogState1, LogEntries),
             NewCommitIndex = update_follower_commit_index(LeaderCommitIndex, CommitIndex, last_log_info(NewLogState)),
             {NewLogState#log_state{commit_index=NewCommitIndex}, true}
     end.
 
-append_log_entries(LogState=#log_state{name=Name}, LogEntries) ->
+append_to_cache(Cache, LogEntries, OldLast, NewLast) ->
+    LogMaps = maps:from_list([{Index, L} || L={Index, _, _, _} <- LogEntries]),
+    Merge = maps:merge(Cache, LogMaps),
+    CacheSize = maps:size(Cache),
+    case maps:size(LogMaps) + CacheSize > ?CACHE_SIZE of
+        true ->
+            maps:without(lists:seq(OldLast - CacheSize + 1, NewLast - ?CACHE_SIZE), Merge);
+        _ ->
+            Merge
+    end.
+
+append_log_entries(LogState=#log_state{name=Name, cache=Cache, last_log_info={OldLastIndex, _}}, LogEntries) ->
     {LastLogIndex, LastLogTerm, _, _} = lists:last(LogEntries),
     % todo may not save last here
     % io:format("~p append ~p logs, last index ~p~n", [Name, length(LogEntries), LastLogIndex]),
+    NewCache = append_to_cache(Cache, LogEntries, OldLastIndex, LastLogIndex),
     dets:insert(Name, LogEntries ++ [{last, LastLogIndex}]),
-    LogState#log_state{last_log_info={LastLogIndex, LastLogTerm}}.
+    LogState#log_state{last_log_info={LastLogIndex, LastLogTerm}, cache=NewCache}.
 
 apply_to_state_machine(_, S, From, To, _, Results) when From > To ->
     {S, Results};
