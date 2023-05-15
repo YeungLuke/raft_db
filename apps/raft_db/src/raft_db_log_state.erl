@@ -1,5 +1,4 @@
 -module(raft_db_log_state).
--include("./raft_db_log_state.hrl").
 
 -export([load_state/1, close/1, save_vote_info/3,
          append_log/4, append_no_op_log/2, append_leader_logs/5,
@@ -15,7 +14,8 @@
                     commit_index=0, % index of highest log entry known to be committed (initialized to 0, increases monotonically)
                     last_applied=0, % index of highest log entry applied to state machine (initialized to 0, increases monotonically)
                     % Other
-                    last_log_info={0, 0}}).
+                    last_log_info={0, 0},
+                    cache=#{}}).
 
 name({_Reg, Node}) when is_atom(Node) ->
     Node;
@@ -108,6 +108,11 @@ append_log(LogState=#log_state{last_log_info={LastLogIndex, _}}, Term, Sn, Cmd) 
 append_no_op_log(LogState, Term) ->
     append_log(LogState, Term, null, {no_op}).
 
+update_follower_commit_index(LeaderCommitIndex, CommitIndex, LastLogIndex) when LeaderCommitIndex > CommitIndex ->
+    min(LeaderCommitIndex, LastLogIndex);
+update_follower_commit_index(_, CommitIndex, _) ->
+    CommitIndex.
+
 append_leader_logs(LogState=#log_state{name=Name, last_log_info=LastLogInfo, commit_index=CommitIndex},
                    LeaderLastIndex, LeaderLastTerm, LeaderCommitIndex, LogEntries) ->
     case log_match(Name, LeaderLastIndex, LeaderLastTerm) of
@@ -123,22 +128,15 @@ append_leader_logs(LogState=#log_state{name=Name, last_log_info=LastLogInfo, com
                     delete_conflict_entries(Name, LastLogInfo, LogIndex),
                     append_log_entries(LogState, LogEntries)
             end,
-            {NewLastLogIndex, _} = last_log_info(NewLogState),
             % If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
-            NewCommitIndex = 
-            case LeaderCommitIndex > CommitIndex of
-                true ->
-                    min(LeaderCommitIndex, NewLastLogIndex);
-                false ->
-                    CommitIndex
-            end,
+            NewCommitIndex = update_follower_commit_index(LeaderCommitIndex, CommitIndex, last_log_info(NewLogState)),
             {NewLogState#log_state{commit_index=NewCommitIndex}, true}
     end.
 
 append_log_entries(LogState=#log_state{name=Name}, LogEntries) ->
     {LastLogIndex, LastLogTerm, _, _} = lists:last(LogEntries),
     % todo may not save last here
-    io:format("~p append ~p logs, last index ~p~n", [Name, length(LogEntries), LastLogIndex]),
+    % io:format("~p append ~p logs, last index ~p~n", [Name, length(LogEntries), LastLogIndex]),
     dets:insert(Name, LogEntries ++ [{last, LastLogIndex}]),
     LogState#log_state{last_log_info={LastLogIndex, LastLogTerm}}.
 
@@ -154,27 +152,20 @@ apply_to_state_machine(Name, S, From, To, NeedReply, Results) ->
             apply_to_state_machine(Name, S, From + 1, To, NeedReply, Results)
     end.
 
-apply_to_state_machine(LogState=#log_state{name=Name,
-                                           commit_index=CommitIndex,
-                                           last_applied=LastApplied,
-                                           state_machine=StateMachine},
-                       MajorityIndex, Term, NeedReply) ->
-    NewCommitIndex =
+update_commit_index(LogState=#log_state{commit_index=CommitIndex}, MajorityIndex, Term) ->
     case log_info(LogState, MajorityIndex) of
         {MajorityIndex, Term} when MajorityIndex > CommitIndex ->
             MajorityIndex;
         _ ->
             CommitIndex
-    end,
-    {NewStateMachine, Results} =
-    case LastApplied < NewCommitIndex of
-        true ->
-            io:format("~p apply log ~p to ~p~n", [Name, LastApplied + 1, NewCommitIndex]),
-            apply_to_state_machine(Name, StateMachine,
-                                   LastApplied + 1, NewCommitIndex, NeedReply, #{});
-        _ ->
-            {StateMachine, #{}}
-    end,
+    end.
+
+apply_to_state_machine(LogState=#log_state{name=Name,
+                                           last_applied=LastApplied,
+                                           state_machine=StateMachine},
+                       MajorityIndex, Term, NeedReply) ->
+    NewCommitIndex = update_commit_index(LogState, MajorityIndex, Term),
+    {NewStateMachine, Results} = apply_to_state_machine(Name, StateMachine, LastApplied + 1, NewCommitIndex, NeedReply, #{}),
     {LogState#log_state{commit_index=NewCommitIndex,
                         last_applied=NewCommitIndex,
                         state_machine=NewStateMachine}, Results}.
