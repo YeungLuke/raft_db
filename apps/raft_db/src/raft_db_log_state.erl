@@ -8,6 +8,7 @@
 
 -define(LOOKUP_LOG_SIZE, 200).
 -define(CACHE_SIZE, 1000).
+-define(MAX_IDLE_APPLY_SIZE, 10000).
 
 -record(log_state, {name,
                     state_machine=raft_db_state_machine:new(),
@@ -64,51 +65,41 @@ load_state(Self) ->
     FileName = file_name(Self),
     {ok, Name} = dets:open_file(Name, [{file, FileName}]),
     LastLogInfo = load_last_log_info(Name),
-    {load_vote_info(Self), #log_state{name=Name,
+    {load_vote_info(Name), #log_state{name=Name,
                                       last_log_info=LastLogInfo,
                                       cache=load_to_cache(Name, LastLogInfo)}}.
 
 close(#log_state{name=Name}) ->
     dets:close(Name).
 
-log_info(#log_state{name=Name, cache=Cache}, Index) ->
+get_log(#log_state{name=Name, cache=Cache}, Index) ->
     case maps:find(Index, Cache) of
-        {ok, {Index, Term, _, _}} ->
-            {Index, Term};
+        {ok, Log} ->
+            Log;
         _ ->
             log_info(Name, Index)
     end;
-log_info(Name, Index) ->
+get_log(Name, Index) ->
     case dets:lookup(Name, Index) of
-        [{Index, Term, _, _}] ->
-            {Index, Term};
+        [Log] ->
+            Log;
         _ ->
-            {0, 0}
+            {0, 0, null, null}
     end.
+
+log_info(LogState, Index) ->
+    {Index, Term, _, _} = get_log(LogState, Index),
+    {Index, Term}.
 
 log_match(_, 0, _) ->
     true;
-log_match(#log_state{name=Name, cache=Cache}, Index, Term) ->
-    case maps:find(Index, Cache) of
-        {ok, {Index, Term, _, _}} ->
-            true;
-        {ok, _} ->
-            false;
-        _ ->
-            log_match(Name, Index, Term)
-    end;
-log_match(Name, Index, Term) ->
-    case dets:lookup(Name, Index) of
-        [{Index, Term, _, _}] ->
-            true;
-        _ ->
-            false
-    end.
+log_match(LogState, Index, Term) ->
+    log_info(LogState, Index) =:= {Index, Term}.
 
 get_logs_in_range(#log_state{name=Name, cache=Cache}, From, To) ->
     case maps:find(From, Cache) of
         {ok, Log} ->
-            [Log] ++ [maps:get(N, Cache) || N <- lists:seq(From + 1, To)];
+            [Log | [maps:get(N, Cache) || N <- lists:seq(From + 1, To)]];
         _ ->
             load_logs_in_range(Name, From, To)
     end.
@@ -163,6 +154,14 @@ append_leader_logs(LogState=#log_state{commit_index=CommitIndex},
             {NewLogState#log_state{commit_index=NewCommitIndex}, true}
     end.
 
+append_to_cache(Cache, [Log], _OldLast, NewLast) ->
+    NewCache = maps:put(NewLast, Log, Cache),
+    case maps:size(NewCache) > ?CACHE_SIZE of
+        true ->
+            maps:remove(NewLast - ?CACHE_SIZE, NewCache);
+        _ ->
+            NewCache
+    end;
 append_to_cache(Cache, LogEntries, OldLast, NewLast) ->
     LogMaps = maps:from_list([{Index, L} || L={Index, _, _, _} <- LogEntries]),
     Merge = maps:merge(Cache, LogMaps),
@@ -184,14 +183,14 @@ append_log_entries(LogState=#log_state{name=Name, cache=Cache, last_log_info={Ol
 
 apply_to_state_machine(_, S, From, To, _, Results) when From > To ->
     {S, Results};
-apply_to_state_machine(Name, S, From, To, NeedReply, Results) ->
-    case dets:lookup(Name, From) of
-        [{From, _, _, Cmd}] ->
+apply_to_state_machine(LogState, S, From, To, NeedReply, Results) ->
+    case get_log(LogState, From) of
+        {From, _, _, Cmd} ->
             {NewS, Result} = raft_db_state_machine:apply_cmd(S, Cmd),
             NewResults = case maps:is_key(From, NeedReply) of true -> Results#{From => Result}; _ -> Results end,
-            apply_to_state_machine(Name, NewS, From + 1, To, NeedReply, NewResults);
+            apply_to_state_machine(LogState, NewS, From + 1, To, NeedReply, NewResults);
         _ ->
-            apply_to_state_machine(Name, S, From + 1, To, NeedReply, Results)
+            apply_to_state_machine(LogState, S, From + 1, To, NeedReply, Results)
     end.
 
 update_commit_index(LogState=#log_state{commit_index=CommitIndex}, MajorityIndex, Term) ->
@@ -202,12 +201,18 @@ update_commit_index(LogState=#log_state{commit_index=CommitIndex}, MajorityIndex
             CommitIndex
     end.
 
+update_apply_index(NeedReply, LastApplied, NewCommitIndex) when map_size(NeedReply) =:= 0 ->
+    min(LastApplied + ?MAX_IDLE_APPLY_SIZE, NewCommitIndex);
+update_apply_index(_, _, NewCommitIndex) ->
+    NewCommitIndex.
+
 apply_to_state_machine(LogState=#log_state{name=Name,
                                            last_applied=LastApplied,
                                            state_machine=StateMachine},
                        MajorityIndex, Term, NeedReply) ->
     NewCommitIndex = update_commit_index(LogState, MajorityIndex, Term),
-    {NewStateMachine, Results} = apply_to_state_machine(Name, StateMachine, LastApplied + 1, NewCommitIndex, NeedReply, #{}),
+    NewApplied = update_apply_index(NeedReply, LastApplied, NewCommitIndex),
+    {NewStateMachine, Results} = apply_to_state_machine(Name, StateMachine, LastApplied + 1, NewApplied, NeedReply, #{}),
     {LogState#log_state{commit_index=NewCommitIndex,
-                        last_applied=NewCommitIndex,
+                        last_applied=NewApplied,
                         state_machine=NewStateMachine}, Results}.
