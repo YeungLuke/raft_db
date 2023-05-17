@@ -77,7 +77,7 @@ get_log(#log_state{name=Name, cache=Cache}, Index) ->
         {ok, Log} ->
             Log;
         _ ->
-            log_info(Name, Index)
+            get_log(Name, Index)
     end;
 get_log(Name, Index) ->
     case dets:lookup(Name, Index) of
@@ -88,8 +88,8 @@ get_log(Name, Index) ->
     end.
 
 log_info(LogState, Index) ->
-    {Index, Term, _, _} = get_log(LogState, Index),
-    {Index, Term}.
+    {I, Term, _, _} = get_log(LogState, Index),
+    {I, Term}.
 
 log_match(_, 0, _) ->
     true;
