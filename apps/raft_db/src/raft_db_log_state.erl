@@ -11,7 +11,7 @@
 -define(MAX_IDLE_APPLY_SIZE, 10000).
 
 -record(log_state, {name,
-                    state_machine=raft_db_state_machine:new(),
+                    state_machine,
                     % Volatile state on all servers:
                     commit_index=0, % index of highest log entry known to be committed (initialized to 0, increases monotonically)
                     last_applied=0, % index of highest log entry applied to state machine (initialized to 0, increases monotonically)
@@ -65,7 +65,10 @@ load_state(Self) ->
     FileName = file_name(Self),
     {ok, Name} = dets:open_file(Name, [{file, FileName}]),
     LastLogInfo = load_last_log_info(Name),
+    MachineName = list_to_atom(atom_to_list(Name)++"_state_machine"),
+    raft_db_state_machine_serv:start_link({MachineName, FileName}),
     {load_vote_info(Name), #log_state{name=Name,
+                                      state_machine = MachineName,
                                       last_log_info=LastLogInfo,
                                       cache=load_to_cache(Name, LastLogInfo)}}.
 
@@ -181,17 +184,17 @@ append_log_entries(LogState=#log_state{name=Name, cache=Cache, last_log_info={Ol
     dets:insert(Name, LogEntries ++ [{last, LastLogIndex}]),
     LogState#log_state{last_log_info={LastLogIndex, LastLogTerm}, cache=NewCache}.
 
-apply_to_state_machine(_, S, From, To, _, Results) when From > To ->
-    {S, Results};
-apply_to_state_machine(LogState, S, From, To, NeedReply, Results) ->
-    case get_log(LogState, From) of
-        {From, _, _, Cmd} ->
-            {NewS, Result} = raft_db_state_machine:apply_cmd(S, Cmd),
-            NewResults = case maps:is_key(From, NeedReply) of true -> Results#{From => Result}; _ -> Results end,
-            apply_to_state_machine(LogState, NewS, From + 1, To, NeedReply, NewResults);
-        _ ->
-            apply_to_state_machine(LogState, S, From + 1, To, NeedReply, Results)
-    end.
+% apply_to_state_machine(_, S, From, To, _, Results) when From > To ->
+%     {S, Results};
+% apply_to_state_machine(LogState, S, From, To, NeedReply, Results) ->
+%     case get_log(LogState, From) of
+%         {From, _, _, Cmd} ->
+%             {NewS, Result} = raft_db_state_machine:apply_cmd(S, Cmd),
+%             NewResults = case maps:is_key(From, NeedReply) of true -> Results#{From => Result}; _ -> Results end,
+%             apply_to_state_machine(LogState, NewS, From + 1, To, NeedReply, NewResults);
+%         _ ->
+%             apply_to_state_machine(LogState, S, From + 1, To, NeedReply, Results)
+%     end.
 
 update_commit_index(LogState=#log_state{commit_index=CommitIndex}, MajorityIndex, Term) ->
     case log_info(LogState, MajorityIndex) of
@@ -201,18 +204,24 @@ update_commit_index(LogState=#log_state{commit_index=CommitIndex}, MajorityIndex
             CommitIndex
     end.
 
-update_apply_index(NeedReply, LastApplied, NewCommitIndex) when map_size(NeedReply) =:= 0 ->
-    min(LastApplied + ?MAX_IDLE_APPLY_SIZE, NewCommitIndex);
-update_apply_index(_, _, NewCommitIndex) ->
-    NewCommitIndex.
+% update_apply_index(NeedReply, LastApplied, NewCommitIndex) when map_size(NeedReply) =:= 0 ->
+%     min(LastApplied + ?MAX_IDLE_APPLY_SIZE, NewCommitIndex);
+% update_apply_index(_, _, NewCommitIndex) ->
+%     NewCommitIndex.
 
-apply_to_state_machine(LogState=#log_state{name=Name,
-                                           last_applied=LastApplied,
-                                           state_machine=StateMachine},
+apply_to_state_machine(LogState=#log_state{last_applied=LastApplied,
+                                           state_machine=StateMachine,
+                                           cache=Cache},
                        MajorityIndex, Term, NeedReply) ->
     NewCommitIndex = update_commit_index(LogState, MajorityIndex, Term),
-    NewApplied = update_apply_index(NeedReply, LastApplied, NewCommitIndex),
-    {NewStateMachine, Results} = apply_to_state_machine(Name, StateMachine, LastApplied + 1, NewApplied, NeedReply, #{}),
+    {NeedSendReply, NewNeedReply} = 
+    case maps:size(NeedReply) of
+        0 ->
+            {#{}, #{}};
+        _ ->
+        {maps:with(lists:seq(LastApplied + 1, NewCommitIndex), NeedReply),
+         maps:without(lists:seq(LastApplied + 1, NewCommitIndex), NeedReply)}
+    end,
+    gen_server:cast(StateMachine, {apply, LastApplied + 1, NewCommitIndex, NeedSendReply, Cache}),
     {LogState#log_state{commit_index=NewCommitIndex,
-                        last_applied=NewApplied,
-                        state_machine=NewStateMachine}, Results}.
+                        last_applied=NewCommitIndex}, NewNeedReply}.

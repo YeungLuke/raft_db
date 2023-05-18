@@ -31,19 +31,19 @@ who_is_leader(Servers) when is_list(Servers) ->
 who_is_leader(Server) ->
     case gen_server:call(Server, who_is_leader) of
         Server ->
-            Server;
+            {ok, Server};
         null ->
-            no_leader;
+            {error, no_leader};
         Other ->
             who_is_leader(Other)
     end.
 
 call(Servers, Cmd) when is_list(Servers) ->
     case who_is_leader(Servers) of
-        no_leader ->
-            {error, no_leader};
-        Leader ->
-            call(Leader, Cmd)
+        {ok, Leader} ->
+            call(Leader, Cmd);
+        {error, no_leader} ->
+            {error, no_leader}
     end;
 call(Server, Cmd) ->
     gen_server:call(Server, {cmd, client_sn_todo, Cmd}).
@@ -176,13 +176,7 @@ handle_cast({response_entries, Server, CurTerm, Succ, FollowerLastIndex},
             % and log[N].term == currentTerm: set commitIndex = N
             MajorityIndex = raft_db_follower_info:majority_index(FollowersInfo#{Server := FollowerInfo2}),
             % apply to state machine (todo if too many applies, and reply is empty, just apply some, or do apply in another proc)
-            {NewLogState, Results} = raft_db_log_state:apply_to_state_machine(LogState, MajorityIndex, CurTerm, NeedReply),
-            % reply to client if commitIndex >= index of client
-            NewNeedReply = maps:fold(fun(Index, V, Reply) ->
-                                        {From, New} = maps:take(Index, Reply),
-                                        gen_server:reply(From, V),
-                                        New
-                                     end, NeedReply, Results),
+            {NewLogState, NewNeedReply} = raft_db_log_state:apply_to_state_machine(LogState, MajorityIndex, CurTerm, NeedReply),
             % if follower matchindex < last, send remain log entries
             FollowerInfo3 = send_remaining_logs(CurTerm, Self, Server, LogState, FollowerInfo2),
             {noreply, State#state{tref=NewTRef,
