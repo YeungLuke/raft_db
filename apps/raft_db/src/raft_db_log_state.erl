@@ -8,7 +8,6 @@
 
 -define(LOOKUP_LOG_SIZE, 200).
 -define(CACHE_SIZE, 1000).
--define(MAX_IDLE_APPLY_SIZE, 10000).
 
 -record(log_state, {name,
                     state_machine,
@@ -184,18 +183,6 @@ append_log_entries(LogState=#log_state{name=Name, cache=Cache, last_log_info={Ol
     dets:insert(Name, LogEntries ++ [{last, LastLogIndex}]),
     LogState#log_state{last_log_info={LastLogIndex, LastLogTerm}, cache=NewCache}.
 
-% apply_to_state_machine(_, S, From, To, _, Results) when From > To ->
-%     {S, Results};
-% apply_to_state_machine(LogState, S, From, To, NeedReply, Results) ->
-%     case get_log(LogState, From) of
-%         {From, _, _, Cmd} ->
-%             {NewS, Result} = raft_db_state_machine:apply_cmd(S, Cmd),
-%             NewResults = case maps:is_key(From, NeedReply) of true -> Results#{From => Result}; _ -> Results end,
-%             apply_to_state_machine(LogState, NewS, From + 1, To, NeedReply, NewResults);
-%         _ ->
-%             apply_to_state_machine(LogState, S, From + 1, To, NeedReply, Results)
-%     end.
-
 update_commit_index(LogState=#log_state{commit_index=CommitIndex}, MajorityIndex, Term) ->
     case log_info(LogState, MajorityIndex) of
         {MajorityIndex, Term} when MajorityIndex > CommitIndex ->
@@ -203,11 +190,6 @@ update_commit_index(LogState=#log_state{commit_index=CommitIndex}, MajorityIndex
         _ ->
             CommitIndex
     end.
-
-% update_apply_index(NeedReply, LastApplied, NewCommitIndex) when map_size(NeedReply) =:= 0 ->
-%     min(LastApplied + ?MAX_IDLE_APPLY_SIZE, NewCommitIndex);
-% update_apply_index(_, _, NewCommitIndex) ->
-%     NewCommitIndex.
 
 apply_to_state_machine(LogState=#log_state{last_applied=LastApplied,
                                            state_machine=StateMachine,
