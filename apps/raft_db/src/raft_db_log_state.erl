@@ -4,10 +4,10 @@
          append_log/4, append_no_op_log/2, append_leader_logs/5,
          log_info/2, last_log_info/1, last_log_index/1, commit_index/1,
          get_logs_from/3,
-         apply_to_state_machine/4]).
+         apply_to_state_machine/4, apply_follower_state_machine/1]).
 
--define(LOOKUP_LOG_SIZE, 200).
--define(CACHE_SIZE, 1000).
+-define(LOOKUP_LOG_SIZE, 1000).
+-define(CACHE_SIZE, 2000).
 
 -record(log_state, {name,
                     state_machine,
@@ -57,7 +57,7 @@ load_to_cache(Name, {LastLogIndex, _}) ->
     maps:from_list([{Index, L} || L={Index, _, _, _} <- LogEntries]).
 
 load_state(ServerName, FileName, MachineName) ->
-    {ok, ServerName} = dets:open_file(ServerName, [{file, FileName}]),
+    {ok, ServerName} = dets:open_file(ServerName, [{file, FileName}, {auto_save, 10}]),
     LastLogInfo = load_last_log_info(ServerName),
     {load_vote_info(ServerName), #log_state{name=ServerName,
                                       state_machine=MachineName,
@@ -133,21 +133,35 @@ update_follower_commit_index(LeaderCommitIndex, CommitIndex, LastLogIndex) when 
 update_follower_commit_index(_, CommitIndex, _) ->
     CommitIndex.
 
-append_leader_logs(LogState=#log_state{commit_index=CommitIndex},
-                   LeaderLastIndex, LeaderLastTerm, LeaderCommitIndex, LogEntries) ->
-    case {log_match(LogState, LeaderLastIndex, LeaderLastTerm), LogEntries} of
+append_leader_logs(LogState=#log_state{commit_index=CommitIndex, last_log_info=LastLogInfo},
+                   PrevLogIndex, PrevLogTerm, LeaderCommitIndex, LogEntries) ->
+    case {log_match(LogState, PrevLogIndex, PrevLogTerm), LogEntries} of
         {false, _} ->
             {LogState, false};
         {true, []} ->
-            NewCommitIndex = update_follower_commit_index(LeaderCommitIndex, CommitIndex, last_log_info(LogState)),
+            NewCommitIndex = update_follower_commit_index(LeaderCommitIndex, CommitIndex, LastLogInfo),
             {LogState#log_state{commit_index=NewCommitIndex}, true};
         {true, [{LogIndex, _, _, _}|_]} ->
-            % If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
-            LogState1 = delete_conflict_entries(LogState, LogIndex),
-            NewLogState = append_log_entries(LogState1, LogEntries),
-            NewCommitIndex = update_follower_commit_index(LeaderCommitIndex, CommitIndex, last_log_info(NewLogState)),
+            {LastLogIndex, LastLogTerm, _, _} = lists:last(LogEntries),
+            NewLogState =
+            case {LastLogIndex, LastLogTerm} =:= LastLogInfo of
+                false ->
+                    % If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it
+                    LogState1 = delete_conflict_entries(LogState, LogIndex),
+                    append_log_entries(LogState1, LogEntries);
+                _ ->
+                    LogState
+            end,
+            NewCommitIndex = update_follower_commit_index(LeaderCommitIndex, CommitIndex, last_log_index(NewLogState)),
             {NewLogState#log_state{commit_index=NewCommitIndex}, true}
     end.
+
+apply_follower_state_machine(LogState=#log_state{last_applied=LastApplied,
+                                                 commit_index=CommitIndex,
+                                                 state_machine=StateMachine,
+                                                 cache=Cache}) ->
+    gen_server:cast(StateMachine, {apply, LastApplied + 1, CommitIndex, #{}, Cache}),
+    LogState#log_state{last_applied=CommitIndex}.
 
 append_to_cache(Cache, [Log], _OldLast, NewLast) ->
     NewCache = maps:put(NewLast, Log, Cache),

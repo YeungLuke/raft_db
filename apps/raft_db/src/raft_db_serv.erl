@@ -7,8 +7,8 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(ELECTION_TIMEOUT, 1000).
--define(MAX_REPLY_SIZE, 500).
--define(MAX_LOG_SIZE, 200).
+-define(MAX_REPLY_SIZE, 2000).
+-define(MAX_LOG_SIZE, 1000).
 
 -record(follower_state, {}).
 -record(candidate_state, {votes = sets:new()}).
@@ -146,9 +146,8 @@ handle_cast({append_entries, Term, LeaderId, _, _, _, _},
 handle_cast({append_entries, Term, LeaderId, LastLogIndex, LastLogTerm, LogEntries, LeaderCommitIndex},
             #state{status=Status, vote_for=VotedFor, cur_term=CurTerm, self=Self, log_state=LogState}=State)
   when Term > CurTerm orelse (Term =:= CurTerm andalso Status =/= leader) ->
-    % todo ignore repeat msg
-    % todo If commitIndex > lastApplied apply to state machine
-    {NewLogState, Succ} = raft_db_log_state:append_leader_logs(LogState, LastLogIndex, LastLogTerm, LeaderCommitIndex, LogEntries),
+    {LogState1, Succ} = raft_db_log_state:append_leader_logs(LogState, LastLogIndex, LastLogTerm, LeaderCommitIndex, LogEntries),
+    NewLogState = raft_db_log_state:apply_follower_state_machine(LogState1),
     send_msg(LeaderId, {response_entries, Self, Term, Succ, raft_db_log_state:last_log_index(NewLogState)}),
     NewVotedFor = case Term > CurTerm of true -> null; false -> VotedFor end,
     {noreply, convert_to_follower(Term, NewVotedFor, LeaderId,
