@@ -1,6 +1,6 @@
 -module(raft_db_log_state).
 
--export([load_state/1, close/1, save_vote_info/3,
+-export([load_state/3, close/1, save_vote_info/3,
          append_log/4, append_no_op_log/2, append_leader_logs/5,
          log_info/2, last_log_info/1, last_log_index/1, commit_index/1,
          get_logs_from/3,
@@ -18,14 +18,6 @@
                     last_log_info={0, 0},
                     cache=#{}}).
 
-name({_Reg, Node}) when is_atom(Node) ->
-    Node;
-name(Self) when is_atom(Self) ->
-    Self.
-
-file_name(Self) ->
-    atom_to_list(name(Self)) ++ ".db".
-
 load_vote_info(Name) ->
     case dets:lookup(Name, state) of
         [{state, Term, VotedFor}] ->
@@ -33,6 +25,11 @@ load_vote_info(Name) ->
         _ ->
             {0, null}
     end.
+
+name({Reg, _Node}) ->
+    Reg;
+name(Self) when is_atom(Self) ->
+    Self.
 
 save_vote_info(Self, Term, VotedFor) ->
     dets:insert(name(Self), {state, Term, VotedFor}).
@@ -59,17 +56,13 @@ load_to_cache(Name, {LastLogIndex, _}) ->
     LogEntries = load_logs_in_range(Name, max(LastLogIndex - ?CACHE_SIZE, 1), LastLogIndex),
     maps:from_list([{Index, L} || L={Index, _, _, _} <- LogEntries]).
 
-load_state(Self) ->
-    Name = name(Self),
-    FileName = file_name(Self),
-    {ok, Name} = dets:open_file(Name, [{file, FileName}]),
-    LastLogInfo = load_last_log_info(Name),
-    MachineName = list_to_atom(atom_to_list(Name)++"_state_machine"),
-    raft_db_state_machine_serv:start_link({MachineName, FileName}),
-    {load_vote_info(Name), #log_state{name=Name,
-                                      state_machine = MachineName,
+load_state(ServerName, FileName, MachineName) ->
+    {ok, ServerName} = dets:open_file(ServerName, [{file, FileName}]),
+    LastLogInfo = load_last_log_info(ServerName),
+    {load_vote_info(ServerName), #log_state{name=ServerName,
+                                      state_machine=MachineName,
                                       last_log_info=LastLogInfo,
-                                      cache=load_to_cache(Name, LastLogInfo)}}.
+                                      cache=load_to_cache(ServerName, LastLogInfo)}}.
 
 close(#log_state{name=Name}) ->
     dets:close(Name).

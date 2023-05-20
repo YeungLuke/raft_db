@@ -1,5 +1,6 @@
 -module(raft_db_state_machine_serv).
 -behaviour(gen_server).
+-include("raft_db_name.hrl").
 
 %% API
 -export([start/1, stop/1, start_link/1]).
@@ -19,12 +20,12 @@ start(Name) ->
 stop(Name) ->
     gen_server:call(Name, stop).
 
-start_link({Name, FileName}) ->
-    gen_server:start_link({local, Name}, ?MODULE, {Name, FileName}, []).
+start_link(#names{machine_name=MachineName, file_name=FileName}) ->
+    gen_server:start_link({local, MachineName}, ?MODULE, {MachineName, FileName}, []).
 
-init({Name, FileName}) ->
-    {ok, Name} = dets:open_file(Name, [{file, FileName}]),
-    {ok, #machine_state{name=Name}}.
+init({MachineName, FileName}) ->
+    {ok, MachineName} = dets:open_file(MachineName, [{file, FileName}]),
+    {ok, #machine_state{name=MachineName}}.
 
 handle_call(stop, _From, State) ->
     {stop, normal, stopped, State};

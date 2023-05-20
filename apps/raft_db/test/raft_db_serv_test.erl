@@ -5,10 +5,10 @@
 -export([start_all/0, stop_all/0, test_speed/1, test_round/2, test_stress/2]).
 
 start_all() ->
-    [raft_db_serv:start_link({Server, ?TEST_SERVERS}) || Server <- ?TEST_SERVERS].
+    [application:start(list_to_atom("raft_db_"++atom_to_list(Server))) || Server <- ?TEST_SERVERS].
 
 stop_all() ->
-    [raft_db_serv:stop(Server) || Server <- ?TEST_SERVERS].
+    [application:stop(list_to_atom("raft_db_"++atom_to_list(Server))) || Server <- ?TEST_SERVERS].
 
 wait_for_leader() ->
     case raft_db_serv:who_is_leader(?TEST_SERVERS) of

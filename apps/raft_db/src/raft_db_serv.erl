@@ -1,5 +1,6 @@
 -module(raft_db_serv).
 -behaviour(gen_server).
+-include("raft_db_name.hrl").
 
 %% API
 -export([start/1, stop/1, start_link/1, who_is_leader/1, put/3, get/2, delete/2]).
@@ -63,16 +64,14 @@ start(Name) ->
 stop(Name) ->
     gen_server:call(Name, stop).
 
-start_link({{Name, Node}=Self, Servers}) when is_atom(Node) ->
-    gen_server:start_link({local, Name}, ?MODULE, {Self, Servers}, []);
-start_link({Self, Servers}) when is_atom(Self) ->
-    gen_server:start_link({local, Self}, ?MODULE, {Self, Servers}, []).
+start_link(Names=#names{server_name=Name}) ->
+    gen_server:start_link({local, Name}, ?MODULE, Names, []).
 
-init({Self, Servers}) ->
-    {{Term, VotedFor}, LogState} = raft_db_log_state:load_state(Self),
-    log("I am follower ~p in term ~p~n", [Self, Term]),
+init(#names{server_name=Name, server=Server, servers=Servers, machine_name=MachineName, file_name=FileName}) ->
+    {{Term, VotedFor}, LogState} = raft_db_log_state:load_state(Name, FileName, MachineName),
+    log("I am follower ~p in term ~p~n", [Server, Term]),
     TRef = erlang:start_timer(rand:uniform(?ELECTION_TIMEOUT) + ?ELECTION_TIMEOUT, self(), election_timeout),
-    {ok, #state{vote_for=VotedFor, cur_term=Term, self=Self, servers=Servers, tref=TRef,
+    {ok, #state{vote_for=VotedFor, cur_term=Term, self=Server, servers=Servers, tref=TRef,
                 log_state=LogState}}.
 
 handle_call(who_is_leader, _From, State) ->

@@ -9,8 +9,8 @@
 
 -export([start/2, stop/1]).
 
-start(_StartType, _StartArgs) ->
-    raft_db_sup:start_link().
+start(_StartType, StartArgs) ->
+    raft_db_sup:start_link(StartArgs).
 
 stop(_State) ->
     ok.
