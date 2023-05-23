@@ -30,7 +30,7 @@ init(#names{servers=Servers}) when length(Servers) < 3 ->
                  period => 1},
     ChildSpecs = [],
     {ok, {SupFlags, ChildSpecs}};
-init(Names=#names{server_name=ServerName, machine_name=MachineName, servers=Servers}) ->
+init(Names=#names{server_name=ServerName, machine_name=MachineName}) ->
     SupFlags = #{strategy => one_for_all,
                  intensity => 0,
                  period => 1},

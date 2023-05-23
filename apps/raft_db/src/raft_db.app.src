@@ -1,7 +1,7 @@
 {application, raft_db,
  [{description, "An OTP application"},
   {vsn, "0.2.0"},
-  {registered, []},
+  {registered, [raft_fake, raft_fake_sup, raft_fake_state_machine]},
   {mod, {raft_db_app, {local, raft_fake, [raft_fake]}}},
   {applications,
    [kernel,

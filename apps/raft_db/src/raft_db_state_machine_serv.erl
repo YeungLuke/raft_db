@@ -70,7 +70,8 @@ apply_to_state_machine(MS=#machine_state{data=S}, From, To, NeedReply) ->
             apply_to_state_machine(MS, From + 1, To, NeedReply)
     end.
 
-terminate(_Reason, _State) ->
+terminate(_Reason, #machine_state{name=MachineName}) ->
+    dets:close(MachineName),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->

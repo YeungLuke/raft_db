@@ -94,8 +94,7 @@ handle_call({cmd, Sn, Cmd}, From, #state{status=leader,
         _ ->
             {reply, {error, too_many_requests}, State}
     end;
-handle_call(stop, _From, #state{log_state=LogState} = State) ->
-    raft_db_log_state:close(LogState),
+handle_call(stop, _From, State) ->
     {stop, normal, stopped, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
@@ -321,7 +320,8 @@ replicate_logs(Term, Self, LogState, FollowersInfo) ->
 log(Format, Args) ->
     io:format(Format, Args).
 
-terminate(_Reason, _State) ->
+terminate(_Reason, #state{log_state=LogState}) ->
+    raft_db_log_state:close(LogState),
     ok.
 
 code_change(_OldVsn, State, _Extra) ->
