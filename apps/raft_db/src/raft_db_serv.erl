@@ -68,6 +68,7 @@ start_link(Names=#names{server_name=Name}) ->
     gen_server:start_link({local, Name}, ?MODULE, Names, []).
 
 init(#names{server_name=Name, server=Server, servers=Servers, machine_name=MachineName, file_name=FileName}) ->
+    process_flag(trap_exit, true),
     {{Term, VotedFor}, LogState} = raft_db_log_state:load_state(Name, FileName, MachineName),
     log("I am follower ~p in term ~p~n", [Server, Term]),
     TRef = erlang:start_timer(rand:uniform(?ELECTION_TIMEOUT) + ?ELECTION_TIMEOUT, self(), election_timeout),
@@ -211,7 +212,7 @@ handle_info(_Info, State) ->
 
 convert_to_candidate(#state{cur_term=CurTerm, self=Self, servers=Servers, log_state=LogState}=State) ->
     NewTerm = CurTerm + 1,
-    log("I am candidate ~p in term ~p~n", [Self, NewTerm]),
+    log("I am candidate ~p in term ~p, last index ~p~n", [Self, NewTerm, raft_db_log_state:last_log_index(LogState)]),
     cancel_timers(State),
     save_state(Self, NewTerm, CurTerm, Self, null),
     Msg = {request_vote, NewTerm, Self, raft_db_log_state:last_log_info(LogState)},
@@ -296,6 +297,7 @@ replicate_one_follower(Term, Self, Follower, LogState, FollowerInfo) ->
             FollowerInfo;
         _ ->
             {PrevIndex, PrevTerm, LogEntries} = get_follower_missing_log(FollowerInfo, LogState),
+            % case LogEntries of [] -> ok; _ -> log("~p send ~p logs to ~p~n", [Self, length(LogEntries), Follower]) end,
             Msg = {append_entries, Term, Self, PrevIndex, PrevTerm, LogEntries, raft_db_log_state:commit_index(LogState)},
             send_msg(Follower, Msg),
             raft_db_follower_info:update_replicate_info(FollowerInfo, Follower, LogEntries)
@@ -320,7 +322,9 @@ replicate_logs(Term, Self, LogState, FollowersInfo) ->
 log(Format, Args) ->
     io:format(Format, Args).
 
-terminate(_Reason, #state{log_state=LogState}) ->
+terminate(Reason, #state{status=Status, self=Self, cur_term=Term, log_state=LogState}) ->
+    io:format("~p ~p in term ~p terminated for reason ~p, last index ~p~n",
+              [Status, Self, Term, Reason, raft_db_log_state:last_log_index(LogState)]),
     raft_db_log_state:close(LogState),
     ok.
 

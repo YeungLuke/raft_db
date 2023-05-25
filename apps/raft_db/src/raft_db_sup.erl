@@ -32,12 +32,14 @@ init(#names{servers=Servers}) when length(Servers) < 3 ->
     {ok, {SupFlags, ChildSpecs}};
 init(Names=#names{server_name=ServerName, machine_name=MachineName}) ->
     SupFlags = #{strategy => one_for_all,
-                 intensity => 0,
-                 period => 1},
+                 intensity => 5,
+                 period => 5},
     ChildSpecs = [#{id => ServerName,
-                    start => {raft_db_serv, start_link, [Names]}},
+                    start => {raft_db_serv, start_link, [Names]},
+                    shutdown => 5000},
                   #{id => MachineName,
-                    start => {raft_db_state_machine_serv, start_link, [Names]}}],
+                    start => {raft_db_state_machine_serv, start_link, [Names]},
+                    shutdown => 5000}],
     {ok, {SupFlags, ChildSpecs}}.
 
 %% internal functions

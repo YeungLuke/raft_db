@@ -24,6 +24,7 @@ start_link(#names{machine_name=MachineName, file_name=FileName}) ->
     gen_server:start_link({local, MachineName}, ?MODULE, {MachineName, FileName}, []).
 
 init({MachineName, FileName}) ->
+    process_flag(trap_exit, true),
     {ok, MachineName} = dets:open_file(MachineName, [{file, FileName}]),
     {ok, #machine_state{name=MachineName}}.
 
