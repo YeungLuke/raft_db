@@ -53,11 +53,11 @@ load_logs_in_range(Name, From, To) ->
     end.
 
 load_to_cache(Name, {LastLogIndex, _}) ->
-    LogEntries = load_logs_in_range(Name, max(LastLogIndex - ?CACHE_SIZE, 1), LastLogIndex),
+    LogEntries = load_logs_in_range(Name, max(LastLogIndex - ?CACHE_SIZE + 1, 1), LastLogIndex),
     maps:from_list([{Index, L} || L={Index, _, _, _} <- LogEntries]).
 
 load_state(ServerName, FileName, MachineName) ->
-    {ok, ServerName} = dets:open_file(ServerName, [{file, FileName}, {auto_save, 10}]),
+    {ok, ServerName} = dets:open_file(ServerName, [{file, FileName}, {auto_save, 1000}]),
     LastLogInfo = load_last_log_info(ServerName),
     {load_vote_info(ServerName), #log_state{name=ServerName,
                                       state_machine=MachineName,
@@ -65,6 +65,7 @@ load_state(ServerName, FileName, MachineName) ->
                                       cache=load_to_cache(ServerName, LastLogInfo)}}.
 
 close(#log_state{name=Name}) ->
+    dets:sync(Name),
     dets:close(Name).
 
 get_log(#log_state{name=Name, cache=Cache}, Index) ->

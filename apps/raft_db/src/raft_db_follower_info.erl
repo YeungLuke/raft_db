@@ -63,6 +63,6 @@ is_cur_href(#follower_info{href=HRef}, MsgHRef) ->
     HRef =:= MsgHRef.
 
 decrement_next_index(FollowerInfo=#follower_info{next_index=NextIndex}) when NextIndex > 0 ->
-    FollowerInfo#follower_info{next_index=NextIndex - 1};
+    FollowerInfo#follower_info{next_index=max(NextIndex - 1000, 1)};
 decrement_next_index(FollowerInfo) ->
     FollowerInfo.
